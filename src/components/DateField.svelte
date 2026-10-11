@@ -16,6 +16,7 @@
     placeholder,
     compact = false,
     tone = true,
+    clearable = true,
   }: {
     value: string | null;
     mode?: "date" | "datetime";
@@ -23,6 +24,7 @@
     placeholder?: string;
     compact?: boolean;
     tone?: boolean;
+    clearable?: boolean;
   } = $props();
 
   let anchor: HTMLButtonElement | undefined = $state();
@@ -49,7 +51,7 @@
 
   const cells = $derived.by(() => {
     const first = new Date(month.getFullYear(), month.getMonth(), 1);
-    const offset = (first.getDay() + 6) % 7;
+    const offset = first.getDay(); // calendário começa no domingo
     const start = iso(new Date(first.getFullYear(), first.getMonth(), 1 - offset));
     return Array.from({ length: 42 }, (_, i) => {
       const d = addDays(start, i);
@@ -162,7 +164,7 @@
         </div>
       </div>
       <div class="grid">
-        {#each ["S", "T", "Q", "Q", "S", "S", "D"] as w, i (i)}<span class="wd">{w}</span>{/each}
+        {#each ["D", "S", "T", "Q", "Q", "S", "S"] as w, i (i)}<span class="wd">{w}</span>{/each}
         {#each cells as c (c.d)}
           <button type="button"
             class="day"
@@ -198,7 +200,7 @@
       </form>
     {/if}
 
-    {#if value}
+    {#if value && clearable}
       <div class="sep"></div>
       <button type="button" class="remove" onclick={() => commit(null)}>
         <X size={15} />

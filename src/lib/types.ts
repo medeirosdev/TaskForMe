@@ -45,11 +45,48 @@ export interface Note {
   projectColor: string;
 }
 
+export interface Link {
+  id: number;
+  projectId: number;
+  sectionId: number | null;
+  title: string;
+  description: string;
+  url: string;
+  position: number;
+  createdAt: string;
+}
+
+export interface EventItem {
+  id: number;
+  projectId: number;
+  title: string;
+  description: string;
+  startDate: string;
+  endDate: string | null;
+  startTime: string | null;
+  endTime: string | null;
+  remindBefore: number | null;
+  remindAt: string | null;
+  createdAt: string;
+  projectName: string;
+  projectColor: string;
+}
+
+export interface SyncStatus {
+  enabled: boolean;
+  repo: string;
+  last: string | null;
+  error: string | null;
+  running: boolean;
+}
+
 export interface Counts {
   today: number;
   overdue: number;
   tomorrow: number;
   week: number;
+  nextWeek: number;
+  events: number;
   projects: [number, number][];
 }
 
@@ -57,6 +94,7 @@ export interface Agenda {
   tasks: Task[];
   notes: Note[];
   overdue: Task[];
+  events: EventItem[];
 }
 
 export interface Bootstrap {
@@ -67,8 +105,11 @@ export interface Bootstrap {
   dataDir: string;
 }
 
-export type FilterKind = "today" | "tomorrow" | "week";
+export type ProjectTab = "tasks" | "notes" | "links" | "events";
+
+export type FilterKind = "today" | "tomorrow" | "week" | "nextweek";
 
 export type View =
   | { kind: FilterKind }
-  | { kind: "project"; id: number; tab: "tasks" | "notes"; noteId?: number };
+  | { kind: "events" }
+  | { kind: "project"; id: number; tab: ProjectTab; noteId?: number };

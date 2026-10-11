@@ -1,17 +1,18 @@
 <script lang="ts">
   import QuickAdd from "./QuickAdd.svelte";
   import TaskRow from "./TaskRow.svelte";
+  import EventCard from "./EventCard.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import { CalendarRange, Eye, EyeOff, Inbox, Plus, StickyNote, Sun, Sunrise } from "../lib/icons";
+  import { CalendarFold, CalendarRange, Eye, EyeOff, Inbox, Plus, StickyNote, Sun, Sunrise } from "../lib/icons";
   import { api } from "../lib/api";
-  import { addDays, longDate, relativeDate, shortDate, weekRange } from "../lib/dates";
+  import { addDays, dayName, longDate, nextWeekRange, shortDate, weekRange } from "../lib/dates";
   import { isVisible, toggleTask } from "../lib/actions";
   import { app } from "../lib/store.svelte";
   import type { Agenda, FilterKind, Note, Task } from "../lib/types";
 
   let { kind }: { kind: FilterKind } = $props();
 
-  let data = $state<Agenda>({ tasks: [], notes: [], overdue: [] });
+  let data = $state<Agenda>({ tasks: [], notes: [], overdue: [], events: [] });
   let loaded = $state(false);
   let addingOn = $state<string | null>(null);
 
@@ -19,6 +20,10 @@
     const t = app.today;
     if (kind === "today") return { from: t, to: t, overdue: t };
     if (kind === "tomorrow") return { from: addDays(t, 1), to: addDays(t, 1), overdue: null };
+    if (kind === "nextweek") {
+      const [a, b] = nextWeekRange(t);
+      return { from: a, to: b, overdue: null };
+    }
     const [a, b] = weekRange(t);
     return { from: a, to: b, overdue: a };
   });
@@ -46,8 +51,11 @@
   const all = $derived([...data.tasks, ...data.overdue]);
   const tasksOn = (d: string) => data.tasks.filter((t) => t.dueDate === d && isVisible(t));
   const notesOn = (d: string) => data.notes.filter((n) => n.noteDate === d);
+  const eventsOn = (d: string) => data.events.filter((e) => e.startDate <= d && (e.endDate ?? e.startDate) >= d);
   const overdue = $derived(data.overdue.filter(isVisible));
   const total = $derived(data.tasks.filter((t) => !t.done).length + data.overdue.filter((t) => !t.done).length);
+
+  const multiDay = $derived(kind === "week" || kind === "nextweek");
 
   const heading = $derived(
     kind === "today"
@@ -55,8 +63,8 @@
       : kind === "tomorrow"
         ? { icon: Sunrise, title: "Amanhã", sub: longDate(addDays(app.today, 1)) }
         : {
-            icon: CalendarRange,
-            title: "Esta semana",
+            icon: kind === "week" ? CalendarRange : CalendarFold,
+            title: kind === "week" ? "Esta semana" : "Próxima semana",
             sub: `${shortDate(range.from, app.today)} – ${shortDate(range.to, app.today)}`,
           },
   );
@@ -117,9 +125,9 @@
 <div class="content">
   <div class="inner">
     <QuickAdd
-      dueDate={kind === "tomorrow" ? addDays(app.today, 1) : app.today}
+      dueDate={kind === "tomorrow" ? addDays(app.today, 1) : kind === "nextweek" ? range.from : app.today}
       pickProject
-      placeholder={kind === "tomorrow" ? "Adicionar tarefa para amanhã" : "Adicionar tarefa para hoje"}
+      placeholder={kind === "tomorrow" ? "Adicionar tarefa para amanhã" : kind === "nextweek" ? "Adicionar tarefa para a próxima semana" : "Adicionar tarefa para hoje"}
     />
 
     {#if overdue.length}
@@ -138,25 +146,29 @@
     {#each days as d (d)}
       {@const ts = tasksOn(d)}
       {@const ns = notesOn(d)}
-      {#if ts.length || ns.length || addingOn === d || (kind === "week" && d >= app.today)}
+      {@const es = eventsOn(d)}
+      {#if es.length || ts.length || ns.length || addingOn === d || (multiDay && d >= app.today)}
         <section class:past={d < app.today}>
           <div class="gh">
             <span class="gname">
-              {#if kind === "week"}
-                {relativeDate(d, app.today)}
+              {#if multiDay}
+                {dayName(d, app.today)}
                 <span class="gdate">{shortDate(d, app.today)}</span>
               {:else}
                 {kind === "today" ? "Hoje" : "Amanhã"}
               {/if}
             </span>
             <span class="gcount">{ts.filter((t) => !t.done).length || ""}</span>
-            {#if kind === "week"}
+            {#if multiDay}
               <button type="button" class="icon-btn sm add" title="Adicionar neste dia" onclick={() => (addingOn = d)}>
                 <Plus size={15} />
               </button>
             {/if}
           </div>
 
+          {#each es as e (e.id)}
+            <EventCard event={e} day={d} showProject />
+          {/each}
           {#each ts as t (t.id)}
             <TaskRow task={t} showProject showDate={false} ontoggle={toggle} />
           {/each}
@@ -166,16 +178,16 @@
 
           {#if addingOn === d}
             <QuickAdd dueDate={d} inline autofocus pickProject onclose={() => (addingOn = null)} />
-          {:else if kind === "week" && !ts.length && !ns.length}
+          {:else if multiDay && !ts.length && !ns.length && !es.length}
             <button type="button" class="nothing" onclick={() => (addingOn = d)}>Nada planejado</button>
           {/if}
         </section>
       {/if}
     {/each}
 
-    {#if loaded && kind !== "week" && !data.tasks.length && !data.notes.length && !overdue.length}
+    {#if loaded && !multiDay && !data.tasks.length && !data.notes.length && !data.events.length && !overdue.length}
       <EmptyState icon={heading.icon} title={kind === "today" ? "Tudo livre por hoje" : "Nada para amanhã"}>
-        Tarefas e notas com data aparecem aqui automaticamente, de todos os projetos.
+        Tarefas, notas e eventos com data aparecem aqui automaticamente, de todos os projetos.
       </EmptyState>
     {/if}
   </div>

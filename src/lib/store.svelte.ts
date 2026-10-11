@@ -1,8 +1,8 @@
 import { SvelteSet } from "svelte/reactivity";
 import { api } from "./api";
-import { addDays, todayIso, weekRange } from "./dates";
+import { addDays, nextWeekRange, todayIso, weekRange } from "./dates";
 import { toast } from "./toast.svelte";
-import type { Counts, Project, Section, View } from "./types";
+import type { Counts, EventItem, Link, Project, Section, View } from "./types";
 
 export const PROJECT_COLORS = [
   "#5e6ad2", // lavanda (Linear)
@@ -23,7 +23,7 @@ class AppStore {
   ready = $state(false);
   projects = $state<Project[]>([]);
   sections = $state<Section[]>([]);
-  counts = $state<Counts>({ today: 0, overdue: 0, tomorrow: 0, week: 0, projects: [] });
+  counts = $state<Counts>({ today: 0, overdue: 0, tomorrow: 0, week: 0, nextWeek: 0, events: 0, projects: [] });
 
   view = $state<View>({ kind: "today" });
   selectedTaskId = $state<number | null>(null);
@@ -46,6 +46,8 @@ class AppStore {
   pendingRename = $state<number | null>(null);
 
   settingsOpen = $state(false);
+  eventDialog = $state<{ projectId: number; date?: string; event?: EventItem } | null>(null);
+  linkDialog = $state<{ projectId: number; sectionId: number | null; link?: Link } | null>(null);
   projectDialog = $state<{ mode: "create" } | { mode: "edit"; project: Project } | null>(null);
 
   inbox = $derived(this.projects.find((p) => p.isInbox));
@@ -80,7 +82,8 @@ class AppStore {
   async refreshCounts() {
     try {
       const [ws, we] = weekRange(this.today);
-      this.counts = await api.counts(this.today, addDays(this.today, 1), ws, we);
+      const [ns, ne] = nextWeekRange(this.today);
+      this.counts = await api.counts(this.today, addDays(this.today, 1), ws, we, ns, ne);
     } catch {
       /* já avisado pelo api */
     }

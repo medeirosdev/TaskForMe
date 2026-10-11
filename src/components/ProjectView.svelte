@@ -1,13 +1,22 @@
 <script lang="ts">
   import Menu from "./Menu.svelte";
+  import EventsPane from "./EventsPane.svelte";
+  import LinksPane from "./LinksPane.svelte";
   import NotesPane from "./NotesPane.svelte";
   import ProjectTasks from "./ProjectTasks.svelte";
   import { ArrowDown, ArrowUp, Ellipsis, Eye, EyeOff, Inbox, Layers, Pencil, Trash } from "../lib/icons";
   import { api } from "../lib/api";
   import { app, deleteWithUndo } from "../lib/store.svelte";
-  import type { Project } from "../lib/types";
+  import type { Project, ProjectTab } from "../lib/types";
 
-  let { project, tab, noteId }: { project: Project; tab: "tasks" | "notes"; noteId?: number } = $props();
+  let { project, tab, noteId }: { project: Project; tab: ProjectTab; noteId?: number } = $props();
+
+  const tabs: { id: ProjectTab; label: string }[] = [
+    { id: "tasks", label: "Tarefas" },
+    { id: "notes", label: "Notas" },
+    { id: "events", label: "Eventos" },
+    { id: "links", label: "Links" },
+  ];
 
   let menuAnchor: HTMLButtonElement | undefined = $state();
   let menuOpen = $state(false);
@@ -50,18 +59,15 @@
 
   <div class="bar">
     <div class="seg" role="tablist">
-      <button type="button"
-        role="tab"
-        aria-selected={tab === "tasks"}
-        class:on={tab === "tasks"}
-        onclick={() => app.navigate({ kind: "project", id: project.id, tab: "tasks" })}>Tarefas</button
-      >
-      <button type="button"
-        role="tab"
-        aria-selected={tab === "notes"}
-        class:on={tab === "notes"}
-        onclick={() => app.navigate({ kind: "project", id: project.id, tab: "notes" })}>Notas</button
-      >
+      {#each tabs as t (t.id)}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === t.id}
+          class:on={tab === t.id}
+          onclick={() => app.navigate({ kind: "project", id: project.id, tab: t.id })}>{t.label}</button
+        >
+      {/each}
     </div>
 
     <div class="tools">
@@ -70,7 +76,9 @@
           {#if app.showDone}<EyeOff size={15} /> Ocultar concluídas{:else}<Eye size={15} /> Mostrar concluídas{/if}
         </button>
       {/if}
-      <button type="button" class="btn btn-secondary" onclick={newSection}><Layers size={15} /> Nova divisão</button>
+      {#if tab !== "events"}
+        <button type="button" class="btn btn-secondary" onclick={newSection}><Layers size={15} /> Nova divisão</button>
+      {/if}
     </div>
   </div>
 </header>
@@ -78,8 +86,12 @@
 <div class="content" class:notes={tab === "notes"}>
   {#if tab === "tasks"}
     <div class="inner"><ProjectTasks {project} /></div>
-  {:else}
+  {:else if tab === "notes"}
     <NotesPane {project} initialNoteId={noteId} />
+  {:else if tab === "events"}
+    <div class="inner"><EventsPane {project} /></div>
+  {:else}
+    <div class="inner"><LinksPane {project} /></div>
   {/if}
 </div>
 

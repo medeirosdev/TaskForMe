@@ -40,3 +40,14 @@ export function autosize(node: HTMLTextAreaElement, _value?: unknown) {
     },
   };
 }
+
+/**
+ * Foca o elemento ao aparecer. O atributo `autofocus` só vale uma vez por
+ * página, então não serve para diálogos abertos várias vezes.
+ */
+export function focusOnMount(node: HTMLInputElement | HTMLTextAreaElement) {
+  queueMicrotask(() => {
+    node.focus();
+    node.select?.();
+  });
+}

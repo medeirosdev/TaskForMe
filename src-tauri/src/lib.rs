@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod logger;
 mod reminders;
+mod sync;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +32,10 @@ impl AppState {
     /// Mutex envenenado (panic em outra thread) não trava o app: recupera a conexão.
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn shared(&self) -> Shared {
+        self.db.clone()
     }
 }
 
@@ -91,6 +96,7 @@ pub fn run() {
         // existente, evitando dois processos escrevendo no mesmo banco.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -135,6 +141,7 @@ pub fn run() {
                 started,
             });
 
+            sync::spawn_scheduler(handle.clone(), shared.clone(), data_dir.clone());
             reminders::spawn(handle.clone(), shared, data_dir);
 
             // Rede de segurança: se a UI não chamar `app_ready` (erro de carregamento),
@@ -195,6 +202,17 @@ pub fn run() {
             commands::notes_by_project,
             commands::agenda,
             commands::counts,
+            commands::links_by_project,
+            commands::link_save,
+            commands::link_delete,
+            commands::open_url,
+            commands::events_by_project,
+            commands::events_all,
+            commands::event_save,
+            commands::event_delete,
+            commands::sync_status,
+            commands::sync_configure,
+            commands::sync_now,
         ])
         .run(tauri::generate_context!());
 

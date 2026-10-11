@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_opener::OpenerExt;
 
 use crate::logger::log;
 use crate::AppState;
@@ -397,6 +398,8 @@ pub fn project_delete(state: State<AppState>, id: i64) -> Res<String> {
     for sql in [
         "UPDATE tasks    SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL",
         "UPDATE notes    SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL",
+        "UPDATE links    SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL",
+        "UPDATE events   SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL",
         "UPDATE sections SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL",
         "UPDATE projects SET deleted_at = ?2 WHERE id = ?1",
     ] {
@@ -413,7 +416,7 @@ pub fn restore(state: State<AppState>, token: String) -> Res<()> {
     let mut conn = state.conn();
     let tx = conn.transaction()?;
     let mut restored = 0;
-    for table in ["projects", "sections", "tasks", "notes"] {
+    for table in ["projects", "sections", "tasks", "notes", "links", "events"] {
         restored += tx.execute(&format!("UPDATE {table} SET deleted_at = NULL WHERE deleted_at = ?1"), [&token])?;
     }
     tx.commit()?;
@@ -477,6 +480,7 @@ pub fn section_delete(state: State<AppState>, id: i64) -> Res<String> {
     for sql in [
         "UPDATE tasks    SET deleted_at = ?2 WHERE section_id = ?1 AND deleted_at IS NULL",
         "UPDATE notes    SET deleted_at = ?2 WHERE section_id = ?1 AND deleted_at IS NULL",
+        "UPDATE links    SET deleted_at = ?2 WHERE section_id = ?1 AND deleted_at IS NULL",
         "UPDATE sections SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
     ] {
         tx.execute(sql, params![id, token])?;
@@ -721,6 +725,7 @@ pub struct Agenda {
     tasks: Vec<Task>,
     notes: Vec<Note>,
     overdue: Vec<Task>,
+    events: Vec<Event>,
 }
 
 /// Tarefas e notas com data entre `from` e `to` (inclusive).
@@ -753,7 +758,16 @@ pub fn agenda(state: State<AppState>, from: String, to: String, overdue_before: 
             .collect::<rusqlite::Result<_>>()?,
     };
 
-    Ok(Agenda { tasks, notes, overdue })
+    // Eventos que tocam o intervalo (inclusive períodos que começaram antes).
+    let events = conn
+        .prepare(&format!(
+            "{EVENT_SELECT} AND e.start_date <= ?2 AND COALESCE(e.end_date, e.start_date) >= ?1
+             ORDER BY e.start_date, e.start_time IS NOT NULL, e.start_time, e.id"
+        ))?
+        .query_map(params![from, to], event_from)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    Ok(Agenda { tasks, notes, overdue, events })
 }
 
 #[derive(Serialize)]
@@ -763,11 +777,21 @@ pub struct Counts {
     overdue: i64,
     tomorrow: i64,
     week: i64,
+    next_week: i64,
+    events: i64,
     projects: Vec<(i64, i64)>,
 }
 
 #[tauri::command]
-pub fn counts(state: State<AppState>, today: String, tomorrow: String, week_start: String, week_end: String) -> Res<Counts> {
+pub fn counts(
+    state: State<AppState>,
+    today: String,
+    tomorrow: String,
+    week_start: String,
+    week_end: String,
+    next_start: String,
+    next_end: String,
+) -> Res<Counts> {
     let conn = state.conn();
     let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Res<i64> {
         Ok(conn.query_row(sql, p, |r| r.get(0))?)
@@ -785,6 +809,455 @@ pub fn counts(state: State<AppState>, today: String, tomorrow: String, week_star
         overdue: count(&format!("{base} AND due_date < ?1"), &[&today])?,
         tomorrow: count(&format!("{base} AND due_date = ?1"), &[&tomorrow])?,
         week: count(&format!("{base} AND due_date BETWEEN ?1 AND ?2"), &[&week_start, &week_end])?,
+        next_week: count(&format!("{base} AND due_date BETWEEN ?1 AND ?2"), &[&next_start, &next_end])?,
+        events: count(
+            "SELECT COUNT(*) FROM events WHERE deleted_at IS NULL AND COALESCE(end_date, start_date) >= ?1",
+            &[&today],
+        )?,
         projects,
     })
+}
+
+// ---------------------------------------------------------------- links úteis
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Link {
+    id: i64,
+    project_id: i64,
+    section_id: Option<i64>,
+    title: String,
+    description: String,
+    url: String,
+    position: i64,
+    created_at: String,
+}
+
+const LINK_SELECT: &str = "
+    SELECT id, project_id, section_id, title, description, url, position, created_at
+    FROM links WHERE deleted_at IS NULL";
+
+fn link_from(r: &Row) -> rusqlite::Result<Link> {
+    Ok(Link {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        section_id: r.get(2)?,
+        title: r.get(3)?,
+        description: r.get(4)?,
+        url: r.get(5)?,
+        position: r.get(6)?,
+        created_at: r.get(7)?,
+    })
+}
+
+fn get_link(conn: &Connection, id: i64) -> Res<Link> {
+    conn.query_row(&format!("{LINK_SELECT} AND id = ?1"), [id], link_from)
+        .optional()?
+        .ok_or_else(|| AppError("Link não encontrado".into()))
+}
+
+/// Aceita "site.com", "www.site.com/x", "https://..." e devolve uma URL http(s)
+/// válida. Recusa qualquer outro esquema (javascript:, file:, etc.).
+pub fn normalize_url(input: &str) -> Res<String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return fail("Informe o endereço do link");
+    }
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) || s.len() > 4000 {
+        return fail("Endereço inválido: não pode ter espaços");
+    }
+    let lower = s.to_ascii_lowercase();
+    let url = if lower.starts_with("http://") || lower.starts_with("https://") {
+        s.to_string()
+    } else if s.contains("://") || lower.starts_with("javascript:") || lower.starts_with("data:") {
+        return fail("Use um endereço que comece com http:// ou https://");
+    } else {
+        format!("https://{s}")
+    };
+    let rest = &url[url.find("://").map(|i| i + 3).unwrap_or(0)..];
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or("");
+    let name = host.split(':').next().unwrap_or("");
+    let ok = !name.is_empty()
+        && (name.contains('.') || name == "localhost")
+        && name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+        && !name.starts_with('.')
+        && !name.ends_with('.');
+    if !ok {
+        return fail("Endereço inválido. Exemplo: https://site.com.br");
+    }
+    Ok(url)
+}
+
+/// Nome padrão a partir do domínio: "https://www.github.com/x" → "github.com".
+fn title_from_url(url: &str) -> String {
+    let rest = &url[url.find("://").map(|i| i + 3).unwrap_or(0)..];
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or(rest);
+    host.trim_start_matches("www.").to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkInput {
+    id: Option<i64>,
+    project_id: i64,
+    section_id: Option<i64>,
+    title: String,
+    description: String,
+    url: String,
+}
+
+#[tauri::command]
+pub fn links_by_project(state: State<AppState>, project_id: i64) -> Res<Vec<Link>> {
+    let conn = state.conn();
+    let mut stmt = conn.prepare(&format!("{LINK_SELECT} AND project_id = ?1 ORDER BY position, id"))?;
+    let rows = stmt.query_map([project_id], link_from)?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Cria (sem `id`) ou atualiza (com `id`) um link.
+#[tauri::command]
+pub fn link_save(state: State<AppState>, input: LinkInput) -> Res<Link> {
+    let conn = state.conn();
+    ensure_project(&conn, input.project_id)?;
+    let section = section_in_project(&conn, input.section_id, input.project_id)?;
+    let url = normalize_url(&input.url)?;
+    let title = clean_title(&input.title, &title_from_url(&url));
+    let description = clean_text(input.description.trim(), 2000);
+    let ts = now();
+
+    let id = match input.id {
+        Some(id) => {
+            get_link(&conn, id)?;
+            conn.execute(
+                "UPDATE links SET project_id = ?2, section_id = ?3, title = ?4, description = ?5,
+                        url = ?6, updated_at = ?7 WHERE id = ?1",
+                params![id, input.project_id, section, title, description, url, ts],
+            )?;
+            id
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO links (project_id, section_id, title, description, url, position, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5,
+                         (SELECT COALESCE(MAX(position), 0) + 1 FROM links WHERE project_id = ?1), ?6, ?6)",
+                params![input.project_id, section, title, description, url, ts],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+    get_link(&conn, id)
+}
+
+#[tauri::command]
+pub fn link_delete(state: State<AppState>, id: i64) -> Res<String> {
+    let token = delete_token();
+    state.conn().execute(
+        "UPDATE links SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        params![id, token],
+    )?;
+    Ok(token)
+}
+
+/// Abre o link no navegador padrão. Revalida a URL: só http(s) sai do app.
+#[tauri::command]
+pub fn open_url(app: AppHandle, url: String) -> Res<()> {
+    let url = normalize_url(&url)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| AppError(format!("Não foi possível abrir o navegador: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normaliza_urls() {
+        assert_eq!(normalize_url("github.com").unwrap(), "https://github.com");
+        assert_eq!(normalize_url("  https://a.com/x?y=1 ").unwrap(), "https://a.com/x?y=1");
+        assert_eq!(normalize_url("http://localhost:3000").unwrap(), "http://localhost:3000");
+        assert_eq!(normalize_url("www.unicamp.br/dac").unwrap(), "https://www.unicamp.br/dac");
+        assert!(normalize_url("javascript:alert(1)").is_err());
+        assert!(normalize_url("file:///etc/passwd").is_err());
+        assert!(normalize_url("ftp://a.com").is_err());
+        assert!(normalize_url("não é url").is_err());
+        assert!(normalize_url("abc").is_err());
+        assert!(normalize_url("").is_err());
+    }
+
+    #[test]
+    fn titulo_padrao_vem_do_dominio() {
+        assert_eq!(title_from_url("https://www.github.com/medeirosdev"), "github.com");
+        assert_eq!(title_from_url("http://localhost:3000/x"), "localhost");
+    }
+}
+
+// ---------------------------------------------------------------- eventos
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    id: i64,
+    project_id: i64,
+    title: String,
+    description: String,
+    start_date: String,
+    end_date: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    remind_before: Option<i64>,
+    remind_at: Option<String>,
+    created_at: String,
+    project_name: String,
+    project_color: String,
+}
+
+const EVENT_SELECT: &str = "
+    SELECT e.id, e.project_id, e.title, e.description, e.start_date, e.end_date,
+           e.start_time, e.end_time, e.remind_before, e.remind_at, e.created_at, p.name, p.color
+    FROM events e
+    JOIN projects p ON p.id = e.project_id
+    WHERE e.deleted_at IS NULL";
+
+fn event_from(r: &Row) -> rusqlite::Result<Event> {
+    Ok(Event {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        title: r.get(2)?,
+        description: r.get(3)?,
+        start_date: r.get(4)?,
+        end_date: r.get(5)?,
+        start_time: r.get(6)?,
+        end_time: r.get(7)?,
+        remind_before: r.get(8)?,
+        remind_at: r.get(9)?,
+        created_at: r.get(10)?,
+        project_name: r.get(11)?,
+        project_color: r.get(12)?,
+    })
+}
+
+fn get_event(conn: &Connection, id: i64) -> Res<Event> {
+    conn.query_row(&format!("{EVENT_SELECT} AND e.id = ?1"), [id], event_from)
+        .optional()?
+        .ok_or_else(|| AppError("Evento não encontrado".into()))
+}
+
+fn valid_time(t: Option<String>) -> Res<Option<String>> {
+    match t.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => chrono::NaiveTime::parse_from_str(&s, "%H:%M")
+            .map(|t| Some(t.format("%H:%M").to_string()))
+            .or_else(|_| fail("Horário inválido (use HH:MM)")),
+    }
+}
+
+/// Horário de referência para avisos de eventos de dia inteiro.
+const ALL_DAY_REMIND_TIME: &str = "09:00";
+/// Maior antecedência aceita para o aviso: 30 dias.
+const MAX_REMIND_BEFORE: i64 = 30 * 24 * 60;
+
+/// Calcula quando avisar: início do evento menos a antecedência.
+/// Devolve (remind_at, já_avisado). Se o momento do aviso já passou mas o
+/// evento ainda vai acontecer, avisa assim que possível; se o evento já
+/// começou, não avisa (seria só ruído).
+fn compute_remind(
+    start_date: &str,
+    start_time: Option<&str>,
+    before_min: Option<i64>,
+    now: NaiveDateTime,
+) -> (Option<String>, bool) {
+    let Some(before) = before_min else { return (None, false) };
+    let start = format!("{start_date}T{}", start_time.unwrap_or(ALL_DAY_REMIND_TIME));
+    let Ok(start) = NaiveDateTime::parse_from_str(&start, "%Y-%m-%dT%H:%M") else { return (None, false) };
+    let at = start - chrono::Duration::minutes(before);
+    let already = at <= now && start <= now;
+    (Some(at.format("%Y-%m-%dT%H:%M").to_string()), already)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventInput {
+    id: Option<i64>,
+    project_id: i64,
+    title: String,
+    description: String,
+    start_date: String,
+    end_date: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    remind_before: Option<i64>,
+}
+
+#[tauri::command]
+pub fn events_by_project(state: State<AppState>, project_id: i64) -> Res<Vec<Event>> {
+    let conn = state.conn();
+    let mut stmt = conn.prepare(&format!(
+        "{EVENT_SELECT} AND e.project_id = ?1 ORDER BY e.start_date, e.start_time IS NOT NULL, e.start_time, e.id"
+    ))?;
+    let rows = stmt.query_map([project_id], event_from)?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Eventos de todos os projetos (tela "Todos os eventos").
+#[tauri::command]
+pub fn events_all(state: State<AppState>) -> Res<Vec<Event>> {
+    let conn = state.conn();
+    let mut stmt = conn.prepare(&format!(
+        "{EVENT_SELECT} AND p.deleted_at IS NULL ORDER BY e.start_date, e.start_time IS NOT NULL, e.start_time, e.id"
+    ))?;
+    let rows = stmt.query_map([], event_from)?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Cria (sem `id`) ou atualiza (com `id`) um evento.
+#[tauri::command]
+pub fn event_save(state: State<AppState>, input: EventInput) -> Res<Event> {
+    let conn = state.conn();
+    ensure_project(&conn, input.project_id)?;
+
+    let Some(start_date) = valid_date(Some(input.start_date))? else {
+        return fail("Informe a data do evento");
+    };
+    // Fim igual ao início (ou antes dele) vira evento de um dia só.
+    let end_date = valid_date(input.end_date)?.filter(|e| e > &start_date);
+    let start_time = valid_time(input.start_time)?;
+    let mut end_time = if start_time.is_some() { valid_time(input.end_time)? } else { None };
+    if end_date.is_none() {
+        if let (Some(s), Some(e)) = (&start_time, &end_time) {
+            if e <= s {
+                end_time = None;
+            }
+        }
+    }
+    let before = match input.remind_before {
+        Some(m) if (0..=MAX_REMIND_BEFORE).contains(&m) => Some(m),
+        Some(_) => return fail("Antecedência do aviso inválida"),
+        None => None,
+    };
+
+    let title = clean_title(&input.title, "Evento");
+    let description = clean_text(input.description.trim(), 5000);
+    let (remind_at, reminded) =
+        compute_remind(&start_date, start_time.as_deref(), before, Local::now().naive_local());
+    let ts = now();
+
+    let id = match input.id {
+        Some(id) => {
+            get_event(&conn, id)?;
+            conn.execute(
+                "UPDATE events SET project_id = ?2, title = ?3, description = ?4, start_date = ?5,
+                        end_date = ?6, start_time = ?7, end_time = ?8, remind_before = ?9,
+                        reminded = CASE WHEN remind_at IS ?10 THEN reminded ELSE ?11 END,
+                        remind_at = ?10, updated_at = ?12
+                 WHERE id = ?1",
+                params![
+                    id, input.project_id, title, description, start_date, end_date, start_time,
+                    end_time, before, remind_at, reminded, ts
+                ],
+            )?;
+            id
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO events (project_id, title, description, start_date, end_date, start_time,
+                                     end_time, remind_before, remind_at, reminded, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params![
+                    input.project_id, title, description, start_date, end_date, start_time,
+                    end_time, before, remind_at, reminded, ts
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+    get_event(&conn, id)
+}
+
+#[tauri::command]
+pub fn event_delete(state: State<AppState>, id: i64) -> Res<String> {
+    let token = delete_token();
+    state.conn().execute(
+        "UPDATE events SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        params![id, token],
+    )?;
+    Ok(token)
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    fn at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").unwrap()
+    }
+
+    #[test]
+    fn aviso_relativo_ao_inicio() {
+        let now = at("2026-10-10T08:00");
+        assert_eq!(
+            compute_remind("2026-10-20", Some("14:00"), Some(60), now),
+            (Some("2026-10-20T13:00".into()), false)
+        );
+        // Dia inteiro: referência às 09:00; 1 dia antes.
+        assert_eq!(
+            compute_remind("2026-10-20", None, Some(1440), now),
+            (Some("2026-10-19T09:00".into()), false)
+        );
+        assert_eq!(compute_remind("2026-10-20", None, None, now), (None, false));
+    }
+
+    #[test]
+    fn aviso_atrasado_so_dispara_se_o_evento_ainda_vai_acontecer() {
+        let now = at("2026-10-10T08:00");
+        // Evento hoje às 10h com aviso de 1 semana antes: avisa já.
+        assert_eq!(
+            compute_remind("2026-10-10", Some("10:00"), Some(10080), now),
+            (Some("2026-10-03T10:00".into()), false)
+        );
+        // Evento que já começou: não avisa.
+        assert_eq!(
+            compute_remind("2026-10-09", Some("10:00"), Some(0), now),
+            (Some("2026-10-09T10:00".into()), true)
+        );
+    }
+}
+
+// ---------------------------------------------------------------- backup no GitHub
+
+#[tauri::command]
+pub fn sync_status(state: State<AppState>) -> crate::sync::Status {
+    crate::sync::status(&state.conn())
+}
+
+#[tauri::command]
+pub fn sync_configure(state: State<AppState>, repo: String, enabled: bool) -> Res<crate::sync::Status> {
+    let repo = repo.trim().to_string();
+    if enabled || !repo.is_empty() {
+        crate::sync::validate_repo(&repo)?;
+    }
+    let conn = state.conn();
+    for (key, value) in [
+        (crate::sync::KEY_REPO, repo.as_str()),
+        (crate::sync::KEY_ENABLED, if enabled { "true" } else { "false" }),
+    ] {
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
+    Ok(crate::sync::status(&conn))
+}
+
+/// Envia agora. Roda fora da thread principal: o git pode demorar.
+#[tauri::command]
+pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Res<String> {
+    let conn = state.shared();
+    let dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::sync::run(&conn, &dir, Some(&app)))
+        .await
+        .map_err(|e| AppError(e.to_string()))?
+        .map_err(AppError)
 }

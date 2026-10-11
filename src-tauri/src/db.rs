@@ -94,6 +94,44 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO projects (name, color, is_inbox, position, created_at)
     VALUES ('Entrada', '#8a8f98', 1, 0, strftime('%Y-%m-%dT%H:%M:%S', 'now', 'localtime'));
     "#,
+    // v2: links úteis por projeto
+    r#"
+    CREATE TABLE links (
+        id          INTEGER PRIMARY KEY,
+        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        section_id  INTEGER REFERENCES sections(id) ON DELETE SET NULL,
+        title       TEXT    NOT NULL,
+        description TEXT    NOT NULL DEFAULT '',
+        url         TEXT    NOT NULL,
+        position    INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT    NOT NULL,
+        updated_at  TEXT    NOT NULL,
+        deleted_at  TEXT
+    );
+    CREATE INDEX idx_links_project ON links(project_id);
+    "#,
+    // v3: eventos (um dia ou período), com aviso relativo ao início
+    r#"
+    CREATE TABLE events (
+        id            INTEGER PRIMARY KEY,
+        project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title         TEXT    NOT NULL,
+        description   TEXT    NOT NULL DEFAULT '',
+        start_date    TEXT    NOT NULL,
+        end_date      TEXT,
+        start_time    TEXT,
+        end_time      TEXT,
+        remind_before INTEGER,
+        remind_at     TEXT,
+        reminded      INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT    NOT NULL,
+        updated_at    TEXT    NOT NULL,
+        deleted_at    TEXT
+    );
+    CREATE INDEX idx_events_project ON events(project_id);
+    CREATE INDEX idx_events_dates   ON events(start_date, end_date);
+    CREATE INDEX idx_events_remind  ON events(remind_at) WHERE reminded = 0;
+    "#,
 ];
 
 pub struct Opened {
@@ -255,6 +293,8 @@ fn maintenance(conn: &Connection, data_dir: &Path) {
         "BEGIN;
          DELETE FROM tasks    WHERE deleted_at IS NOT NULL AND deleted_at < '{cutoff}';
          DELETE FROM notes    WHERE deleted_at IS NOT NULL AND deleted_at < '{cutoff}';
+         DELETE FROM links    WHERE deleted_at IS NOT NULL AND deleted_at < '{cutoff}';
+         DELETE FROM events   WHERE deleted_at IS NOT NULL AND deleted_at < '{cutoff}';
          DELETE FROM sections WHERE deleted_at IS NOT NULL AND deleted_at < '{cutoff}';
          DELETE FROM projects WHERE deleted_at IS NOT NULL AND deleted_at < '{cutoff}' AND is_inbox = 0;
          COMMIT;"
@@ -391,6 +431,32 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().starts_with("taskforme.corrupt-"));
         assert!(!quarantined);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atualiza_banco_antigo_sem_perder_dados() {
+        let dir = temp_dir("upgrade");
+        {
+            let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute("INSERT INTO projects (name, created_at) VALUES ('Antigo', 'x')", []).unwrap();
+        }
+        let opened = open(&dir).unwrap();
+        let n: i64 = opened
+            .conn
+            .query_row("SELECT COUNT(*) FROM projects WHERE name = 'Antigo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let links: i64 = opened.conn.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0)).unwrap();
+        assert_eq!(links, 0);
+        let events: i64 = opened.conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(events, 0);
+        let pre = list_backups(&dir)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("pre-migration"));
+        assert!(pre, "backup antes da migration");
         fs::remove_dir_all(&dir).ok();
     }
 

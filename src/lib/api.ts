@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "./toast.svelte";
-import type { Agenda, Bootstrap, Counts, Note, Project, Section, Task } from "./types";
+import type { Agenda, Bootstrap, Counts, EventItem, Link, Note, Project, Section, SyncStatus, Task } from "./types";
 
 /** Erro já mostrado ao usuário: o handler global não precisa avisar de novo. */
 export class HandledError extends Error {
@@ -48,6 +48,9 @@ export const api = {
   autostartSet: (enabled: boolean) => call<void>("autostart_set", { enabled }),
   backup: () => call<string>("backup_create"),
   openDataDir: () => call<void>("open_data_dir"),
+  syncStatus: () => call<SyncStatus>("sync_status"),
+  syncConfigure: (repo: string, enabled: boolean) => call<SyncStatus>("sync_configure", { repo, enabled }),
+  syncNow: () => call<string>("sync_now"),
 
   projects: () => call<Project[]>("projects_list"),
   projectCreate: (name: string, color: string) => call<number>("project_create", { name, color }),
@@ -83,8 +86,41 @@ export const api = {
   note: (id: number) => call<Note>("note_get", { id }),
   notesByProject: (projectId: number) => call<Note[]>("notes_by_project", { projectId }),
 
+  linksByProject: (projectId: number) => call<Link[]>("links_by_project", { projectId }),
+  linkSave: (input: {
+    id: number | null;
+    projectId: number;
+    sectionId: number | null;
+    title: string;
+    description: string;
+    url: string;
+  }) => call<Link>("link_save", { input }),
+  linkDelete: (id: number) => call<string>("link_delete", { id }),
+  openUrl: (url: string) => call<void>("open_url", { url }),
+
+  eventsByProject: (projectId: number) => call<EventItem[]>("events_by_project", { projectId }),
+  eventsAll: () => call<EventItem[]>("events_all"),
+  eventSave: (input: {
+    id: number | null;
+    projectId: number;
+    title: string;
+    description: string;
+    startDate: string;
+    endDate: string | null;
+    startTime: string | null;
+    endTime: string | null;
+    remindBefore: number | null;
+  }) => call<EventItem>("event_save", { input }),
+  eventDelete: (id: number) => call<string>("event_delete", { id }),
+
   agenda: (from: string, to: string, overdueBefore: string | null) =>
     call<Agenda>("agenda", { from, to, overdueBefore }),
-  counts: (today: string, tomorrow: string, weekStart: string, weekEnd: string) =>
-    call<Counts>("counts", { today, tomorrow, weekStart, weekEnd }),
+  counts: (
+    today: string,
+    tomorrow: string,
+    weekStart: string,
+    weekEnd: string,
+    nextStart: string,
+    nextEnd: string,
+  ) => call<Counts>("counts", { today, tomorrow, weekStart, weekEnd, nextStart, nextEnd }),
 };

@@ -1,5 +1,6 @@
 <script lang="ts">
   import Modal from "./Modal.svelte";
+  import SyncSettings from "./SyncSettings.svelte";
   import { Monitor, Moon, Sun } from "../lib/icons";
   import { api } from "../lib/api";
   import { app, type ThemeSetting } from "../lib/store.svelte";
@@ -34,8 +35,8 @@
   }
 
   const shortcuts: [string, string][] = [
-    ["Ctrl N", "Nova tarefa (ou nota, na aba Notas)"],
-    ["Ctrl 1 – 4", "Entrada, Hoje, Amanhã, Esta semana"],
+    ["Ctrl N", "Novo item da aba aberta (tarefa, nota, evento ou link)"],
+    ["Ctrl 1 – 6", "Entrada, Hoje, Amanhã, Esta semana, Próxima semana, Todos os eventos"],
     ["Esc", "Fechar painel"],
     ["Ctrl S", "Salvar nota agora (já salva sozinho)"],
   ];
@@ -45,7 +46,7 @@
   <button type="button" class="switch" class:on role="switch" aria-checked={on} aria-label={label} {onclick}><span></span></button>
 {/snippet}
 
-<Modal title="Configurações" onclose={() => (app.settingsOpen = false)} width={480}>
+<Modal title="Configurações" onclose={() => (app.settingsOpen = false)} width={520}>
   <div class="body">
     <div class="row col">
       <span class="name">Tema</span>
@@ -85,6 +86,8 @@
         <button type="button" class="btn btn-ghost" onclick={() => api.openDataDir().catch(() => {})}>Abrir pasta</button>
       </div>
     </div>
+
+    <SyncSettings />
 
     <div class="row col">
       <span class="name">Atalhos</span>

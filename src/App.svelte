@@ -3,11 +3,14 @@
   import { listen } from "@tauri-apps/api/event";
   import Sidebar from "./components/Sidebar.svelte";
   import AgendaView from "./components/AgendaView.svelte";
+  import AllEventsView from "./components/AllEventsView.svelte";
   import ProjectView from "./components/ProjectView.svelte";
   import TaskDetail from "./components/TaskDetail.svelte";
   import Toasts from "./components/Toasts.svelte";
   import ProjectDialog from "./components/ProjectDialog.svelte";
   import SettingsDialog from "./components/SettingsDialog.svelte";
+  import LinkDialog from "./components/LinkDialog.svelte";
+  import EventDialog from "./components/EventDialog.svelte";
   import { api } from "./lib/api";
   import { todayIso } from "./lib/dates";
   import { app, flushAll } from "./lib/store.svelte";
@@ -88,7 +91,7 @@
 
   function onKey(e: KeyboardEvent) {
     const mod = e.ctrlKey || e.metaKey;
-    if (e.key === "Escape" && app.selectedTaskId !== null && !app.settingsOpen && !app.projectDialog) {
+    if (e.key === "Escape" && app.selectedTaskId !== null && !app.settingsOpen && !app.projectDialog && !app.linkDialog && !app.eventDialog) {
       app.closeTask();
       return;
     }
@@ -99,6 +102,10 @@
       const v = app.view;
       if (v.kind === "project" && v.tab === "notes") {
         window.dispatchEvent(new CustomEvent("tfm:new-note"));
+      } else if (v.kind === "events" || (v.kind === "project" && v.tab === "events")) {
+        window.dispatchEvent(new CustomEvent("tfm:new-event"));
+      } else if (v.kind === "project" && v.tab === "links") {
+        window.dispatchEvent(new CustomEvent("tfm:new-link"));
       } else {
         document.querySelector<HTMLInputElement>("[data-quickadd]")?.focus();
       }
@@ -108,9 +115,11 @@
       { kind: "today" as const },
       { kind: "tomorrow" as const },
       { kind: "week" as const },
+      { kind: "nextweek" as const },
+      { kind: "events" as const },
     ];
     const n = Number(k);
-    if (n >= 1 && n <= 4 && views[n - 1]) {
+    if (n >= 1 && n <= 6 && views[n - 1]) {
       e.preventDefault();
       app.navigate(views[n - 1]!);
     }
@@ -140,6 +149,8 @@
             {#if currentProject}
               <ProjectView project={currentProject} tab={app.view.tab} noteId={app.view.noteId} />
             {/if}
+          {:else if app.view.kind === "events"}
+            <AllEventsView />
           {:else}
             <AgendaView kind={app.view.kind} />
           {/if}
@@ -166,6 +177,8 @@
 
 {#if app.projectDialog}<ProjectDialog />{/if}
 {#if app.settingsOpen}<SettingsDialog />{/if}
+{#if app.linkDialog}<LinkDialog />{/if}
+{#if app.eventDialog}<EventDialog />{/if}
 <Toasts />
 
 <style>

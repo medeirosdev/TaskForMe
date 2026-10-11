@@ -94,6 +94,35 @@ fn collect_due(conn: &Connection) -> rusqlite::Result<Vec<Due>> {
         }
     }
 
+    {
+        let mut stmt = tx.prepare(
+            "SELECT e.title, p.name, e.start_date, e.end_date, e.start_time FROM events e
+             JOIN projects p ON p.id = e.project_id
+             WHERE e.reminded = 0 AND e.remind_at IS NOT NULL AND e.remind_at <= ?1 AND e.deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map([&now], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let today = Local::now().date_naive();
+        for row in rows {
+            let (title, project, start, end, time) = row?;
+            out.push(Due {
+                title: format!("📅 {title}"),
+                body: format!("{} · {project}", event_when(&start, end.as_deref(), time.as_deref(), today)),
+            });
+        }
+    }
+
+    tx.execute(
+        "UPDATE events SET reminded = 1 WHERE reminded = 0 AND remind_at IS NOT NULL AND remind_at <= ?1",
+        [&now],
+    )?;
     tx.execute(
         "UPDATE tasks SET reminded = 1 WHERE reminded = 0 AND remind_at IS NOT NULL AND remind_at <= ?1",
         [&now],
@@ -104,6 +133,24 @@ fn collect_due(conn: &Connection) -> rusqlite::Result<Vec<Due>> {
     )?;
     tx.commit()?;
     Ok(out)
+}
+
+/// "Hoje às 14:00", "Amanhã (dia inteiro)", "20/10 a 23/10".
+fn event_when(start: &str, end: Option<&str>, time: Option<&str>, today: chrono::NaiveDate) -> String {
+    let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+    let label = |d: chrono::NaiveDate| match (d - today).num_days() {
+        0 => "Hoje".to_string(),
+        1 => "Amanhã".to_string(),
+        _ => d.format("%d/%m").to_string(),
+    };
+    let Some(s) = parse(start) else { return start.to_string() };
+    if let Some(e) = end.and_then(parse) {
+        return format!("{} a {}", label(s), label(e));
+    }
+    match time {
+        Some(t) => format!("{} às {t}", label(s)),
+        None => format!("{} (dia inteiro)", label(s)),
+    }
 }
 
 fn hhmm(at: &str) -> &str {

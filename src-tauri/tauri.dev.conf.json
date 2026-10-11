@@ -1,0 +1,19 @@
+{
+  "identifier": "com.medeiros.taskforme.dev",
+  "productName": "TaskForMe Dev",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TaskForMe (dev)",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 520,
+        "center": true,
+        "visible": false,
+        "backgroundColor": "#0f1011"
+      }
+    ]
+  }
+}

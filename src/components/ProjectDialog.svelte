@@ -2,6 +2,7 @@
   import Modal from "./Modal.svelte";
   import { Check } from "../lib/icons";
   import { api } from "../lib/api";
+  import { focusOnMount } from "../lib/portal";
   import { app, PROJECT_COLORS } from "../lib/store.svelte";
 
   const dialog = app.projectDialog!;
@@ -45,8 +46,7 @@
   >
     <label class="field">
       <span>Nome</span>
-      <!-- svelte-ignore a11y_autofocus -->
-      <input class="input" bind:value={name} maxlength="120" placeholder="Ex.: Trabalho, Faculdade, Casa" autofocus />
+      <input class="input" bind:value={name} maxlength="120" placeholder="Ex.: Trabalho, Faculdade, Casa" use:focusOnMount />
     </label>
 
     <div class="field">

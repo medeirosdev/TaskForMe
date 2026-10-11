@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Component } from "svelte";
-  import { CalendarRange, Inbox, Plus, Settings, Sun, Sunrise } from "../lib/icons";
+  import { CalendarClock, CalendarFold, CalendarRange, Inbox, Plus, Settings, Sun, Sunrise } from "../lib/icons";
   import { app } from "../lib/store.svelte";
   import type { View } from "../lib/types";
 
@@ -36,6 +36,8 @@
     {@render nav({ kind: "today" }, Sun, "Hoje", app.counts.today + app.counts.overdue, app.counts.overdue > 0)}
     {@render nav({ kind: "tomorrow" }, Sunrise, "Amanhã", app.counts.tomorrow)}
     {@render nav({ kind: "week" }, CalendarRange, "Esta semana", app.counts.week)}
+    {@render nav({ kind: "nextweek" }, CalendarFold, "Próxima semana", app.counts.nextWeek)}
+    {@render nav({ kind: "events" }, CalendarClock, "Todos os eventos", app.counts.events)}
   </div>
 
   <div class="section-head">

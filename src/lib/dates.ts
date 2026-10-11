@@ -25,12 +25,19 @@ export function diffDays(a: string, b: string): number {
   return Math.round((parseIso(a).getTime() - parseIso(b).getTime()) / 86_400_000);
 }
 
-/** Semana de segunda a domingo. */
+/**
+ * Semana de domingo a domingo, contando os dois domingos (8 dias).
+ * Começa no domingo de hoje ou no último domingo que passou.
+ */
 export function weekRange(s: string): [string, string] {
-  const d = parseIso(s);
-  const offset = (d.getDay() + 6) % 7;
-  const start = addDays(s, -offset);
-  return [start, addDays(start, 6)];
+  const start = addDays(s, -parseIso(s).getDay());
+  return [start, addDays(start, 7)];
+}
+
+/** A semana seguinte (também de domingo a domingo). */
+export function nextWeekRange(s: string): [string, string] {
+  const [start] = weekRange(s);
+  return [addDays(start, 7), addDays(start, 14)];
 }
 
 export function nextWeekday(s: string, weekday: number): string {
@@ -62,6 +69,15 @@ export function relativeDate(s: string, today = todayIso()): string {
   if (diff === -1) return "Ontem";
   if (diff > 1 && diff < 7) return cap(fmtWeekday.format(parseIso(s)).replace("-feira", ""));
   return shortDate(s, today);
+}
+
+/** "Hoje", "Amanhã", "Ontem" ou o nome do dia ("Domingo", "Segunda"…). */
+export function dayName(s: string, today = todayIso()): string {
+  const diff = diffDays(s, today);
+  if (diff === 0) return "Hoje";
+  if (diff === 1) return "Amanhã";
+  if (diff === -1) return "Ontem";
+  return cap(fmtWeekday.format(parseIso(s)).replace("-feira", ""));
 }
 
 export function longDate(s: string): string {
