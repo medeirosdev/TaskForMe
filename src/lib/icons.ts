@@ -30,6 +30,7 @@ export { default as Monitor } from "@lucide/svelte/icons/monitor";
 export { default as Moon } from "@lucide/svelte/icons/moon";
 export { default as Pencil } from "@lucide/svelte/icons/pencil";
 export { default as Plus } from "@lucide/svelte/icons/plus";
+export { default as Repeat } from "@lucide/svelte/icons/repeat";
 export { default as Settings } from "@lucide/svelte/icons/settings";
 export { default as StickyNote } from "@lucide/svelte/icons/sticky-note";
 export { default as Sun } from "@lucide/svelte/icons/sun";

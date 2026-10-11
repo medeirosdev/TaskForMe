@@ -25,12 +25,31 @@ use crate::Shared;
 const REPO_DIR: &str = "sync-repo";
 const DUMP_FILE: &str = "taskforme.sql";
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
+const TIMEOUT_PREFIX: &str = "O git demorou demais para responder (sem internet?)";
+const BUSY: &str = "Um envio ou restauração já está em andamento";
+const NO_REMOTE_BRANCH: &str = "couldn't find remote ref";
 /// Com o app aberto, envia de novo quando o último envio tiver mais de ~20 h.
 const RESEND_AFTER_HOURS: i64 = 20;
 /// Esperas entre tentativas quando falha (rede ainda subindo no boot, etc.).
 const RETRY_MINUTES: [u64; 4] = [2, 10, 30, 60];
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Libera a trava de "envio em andamento" ao sair do escopo — inclusive se
+/// algo der panic no meio. Sem isso, um erro raro travaria o backup até reiniciar.
+struct RunningGuard;
+
+impl RunningGuard {
+    fn acquire() -> Option<Self> {
+        (!RUNNING.swap(true, Ordering::SeqCst)).then_some(RunningGuard)
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+}
 
 // ---------------------------------------------------------------- configurações
 
@@ -171,6 +190,11 @@ Este repositório é atualizado automaticamente pelo app TaskForMe
 
 ## Restaurar
 
+**Pelo app (recomendado):** Configurações → Backup no GitHub → **Restaurar do GitHub**.
+O app confere o backup, guarda uma cópia dos dados atuais e só então substitui.
+
+**Manualmente** (precisa do programa `sqlite3`):
+
 1. Feche o TaskForMe (inclusive na bandeja → Sair).
 2. Renomeie o arquivo atual `taskforme.db` (para guardar uma cópia) na pasta de dados:
    - Linux: `~/.local/share/com.medeiros.taskforme/`
@@ -214,26 +238,34 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         }
     })?;
 
+    // Lê as saídas em paralelo: se o git escrever muito, o pipe não enche e trava.
+    let read_all = |pipe: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_reader = read_all(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err_reader = read_all(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) if start.elapsed() > GIT_TIMEOUT => {
                 let _ = child.kill();
-                return Err(format!("git {} demorou demais (sem internet?)", args.first().unwrap_or(&"")));
+                let _ = child.wait();
+                return Err(format!("{TIMEOUT_PREFIX} (git {})", args.first().unwrap_or(&"")));
             }
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(e.to_string()),
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut stdout);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
-    }
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     if status.success() {
         Ok(stdout)
     } else {
@@ -251,6 +283,8 @@ fn friendly_git_error(stderr: &str) -> String {
         "Repositório não encontrado. Confira o endereço e se ele já foi criado no GitHub.".into()
     } else if s.contains("could not resolve host") || s.contains("network is unreachable") || s.contains("connection timed out") {
         "Sem conexão com a internet. Vou tentar de novo mais tarde.".into()
+    } else if s.contains(NO_REMOTE_BRANCH) {
+        format!("Falha no git: {NO_REMOTE_BRANCH} main")
     } else {
         let last = stderr.lines().last().unwrap_or("erro desconhecido");
         format!("Falha no git: {last}")
@@ -282,27 +316,34 @@ fn prepare_repo(dir: &Path, url: &str) -> Result<(), String> {
     } else {
         git(dir, &["remote", "set-url", "origin", url])?;
     }
-    // Repositório recém-criado no GitHub não tem branch ainda: tudo bem.
     match git(dir, &["fetch", "-q", "origin", "main"]) {
         Ok(_) => {
-            // Mantém os arquivos locais e passa a seguir o histórico do remoto:
-            // o próximo commit entra por cima dele (sem conflitos).
-            git(dir, &["reset", "-q", "--soft", "FETCH_HEAD"])?;
+            // Passa a seguir o histórico do remoto sem mexer nos arquivos locais:
+            // o próximo commit entra por cima dele (sem conflitos). `--mixed`
+            // mantém no índice os arquivos que só existem no remoto.
+            git(dir, &["reset", "-q", "--mixed", "FETCH_HEAD"])?;
+            Ok(())
         }
-        Err(e) if e.contains("Sem permissão") || e.contains("não encontrado") || e.contains("conexão") => {
-            return Err(e)
-        }
-        Err(_) => {} // branch main ainda não existe no remoto
+        // Repositório recém-criado no GitHub ainda não tem a branch main.
+        Err(e) if e.contains(NO_REMOTE_BRANCH) => Ok(()),
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
 fn has_identity(dir: &Path) -> bool {
-    git(dir, &["config", "user.email"]).map(|s| !s.trim().is_empty()).unwrap_or(false)
+    let set = |key| git(dir, &["config", key]).map(|s| !s.trim().is_empty()).unwrap_or(false);
+    set("user.email") && set("user.name")
 }
 
 fn commit_and_push(dir: &Path) -> Result<bool, String> {
-    git(dir, &["add", "-A"])?;
+    // Só os arquivos do backup: qualquer outro arquivo do repositório fica intacto.
+    let files: Vec<&str> = [DUMP_FILE, "README.md"].into_iter().filter(|f| dir.join(f).exists()).collect();
+    if files.is_empty() {
+        return Err("Nada para enviar".into());
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(files);
+    git(dir, &add)?;
     // Nada mudou desde o último envio?
     let changed = git(dir, &["diff", "--cached", "--quiet"]).is_err();
     let has_head = git(dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
@@ -320,11 +361,29 @@ fn commit_and_push(dir: &Path) -> Result<bool, String> {
     Ok(changed)
 }
 
+/// Prepara o repositório local. Se o endereço HTTPS falhar por falta de login,
+/// tenta o mesmo repositório via SSH (a chave costuma já estar configurada) e,
+/// se der certo, passa a usar o SSH.
+fn connect(conn: &Shared, dir: &Path, url: &str) -> Result<(), String> {
+    match prepare_repo(dir, url) {
+        Ok(()) => Ok(()),
+        Err(e) if is_auth_error(&e) => {
+            let ssh = https_to_ssh(url).ok_or(e.clone())?;
+            prepare_repo(dir, &ssh).map_err(|_| e)?;
+            let c = conn.lock().unwrap_or_else(|e| e.into_inner());
+            set_setting(&c, KEY_REPO, Some(&ssh));
+            log(&format!("Sync: HTTPS sem login; passando a usar {ssh}"));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Executa um envio completo. Devolve uma mensagem curta de resultado.
 pub fn run(conn: &Shared, data_dir: &Path, app: Option<&AppHandle>) -> Result<String, String> {
-    if RUNNING.swap(true, Ordering::SeqCst) {
-        return Err("Um envio já está em andamento".into());
-    }
+    let Some(guard) = RunningGuard::acquire() else {
+        return Err(BUSY.into());
+    };
     let notify = |app: Option<&AppHandle>, conn: &Shared| {
         if let Some(app) = app {
             let st = status(&conn.lock().unwrap_or_else(|e| e.into_inner()));
@@ -341,19 +400,7 @@ pub fn run(conn: &Shared, data_dir: &Path, app: Option<&AppHandle>) -> Result<St
             (validate_repo(&url)?, dump(&c).map_err(|e| format!("Falha ao exportar os dados: {e}"))?)
         };
         let dir: PathBuf = data_dir.join(REPO_DIR);
-        match prepare_repo(&dir, &url) {
-            Ok(()) => {}
-            // HTTPS sem login salvo do Git: tenta o mesmo repositório via SSH
-            // (a chave SSH costuma já estar configurada). Se der certo, adota.
-            Err(e) if is_auth_error(&e) => {
-                let ssh = https_to_ssh(&url).ok_or(e.clone())?;
-                prepare_repo(&dir, &ssh).map_err(|_| e)?;
-                let c = conn.lock().unwrap_or_else(|e| e.into_inner());
-                set_setting(&c, KEY_REPO, Some(&ssh));
-                log(&format!("Sync: HTTPS sem login; passando a usar {ssh}"));
-            }
-            Err(e) => return Err(e),
-        }
+        connect(conn, &dir, &url)?;
         fs::write(dir.join(DUMP_FILE), sql).map_err(|e| e.to_string())?;
         fs::write(dir.join("README.md"), REPO_README).map_err(|e| e.to_string())?;
         let changed = commit_and_push(&dir)?;
@@ -370,13 +417,102 @@ pub fn run(conn: &Shared, data_dir: &Path, app: Option<&AppHandle>) -> Result<St
             Err(e) => set_setting(&c, KEY_ERROR, Some(e)),
         }
     }
-    RUNNING.store(false, Ordering::SeqCst);
+    drop(guard);
     match &result {
         Ok(m) => log(&format!("Sync: {m}")),
         Err(e) => log(&format!("Sync falhou: {e}")),
     }
     notify(app, conn);
     result
+}
+
+// ---------------------------------------------------------------- restauração
+
+/// Baixa o último `taskforme.sql` do repositório remoto.
+fn fetch_remote_dump(dir: &Path) -> Result<String, String> {
+    match git(dir, &["fetch", "-q", "origin", "main"]) {
+        Ok(_) => {}
+        Err(e) if e.contains(NO_REMOTE_BRANCH) => return Err("Ainda não há nenhum backup nesse repositório".into()),
+        Err(e) => return Err(e),
+    }
+    git(dir, &["show", &format!("FETCH_HEAD:{DUMP_FILE}")])
+        .map_err(|_| "O repositório não tem o arquivo taskforme.sql".to_string())
+}
+
+/// Confere se o SQL baixado é um backup íntegro do TaskForMe e o carrega em memória.
+fn load_dump(sql: &str) -> Result<Connection, String> {
+    let mem = Connection::open_in_memory().map_err(|e| e.to_string())?;
+    mem.execute_batch(sql).map_err(|e| format!("O backup está danificado: {e}"))?;
+    let version: i64 = mem.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if version < 1 || version as usize > crate::db::schema_version() {
+        return Err("Esse backup é de uma versão mais nova do TaskForMe. Atualize o app antes de restaurar.".into());
+    }
+    let inbox: i64 = mem
+        .query_row("SELECT COUNT(*) FROM projects WHERE is_inbox = 1", [], |r| r.get(0))
+        .map_err(|_| "O arquivo não parece um backup do TaskForMe".to_string())?;
+    if inbox == 0 {
+        return Err("O arquivo não parece um backup do TaskForMe".into());
+    }
+    Ok(mem)
+}
+
+/// Substitui os dados atuais pelos do backup em memória. Antes, guarda uma
+/// cópia local (`pre-restore`) e preserva as configurações do próprio backup.
+fn replace_live(live: &mut Connection, mem: &Connection, data_dir: &Path) -> Result<(), String> {
+    let keep: Vec<(String, String)> = live
+        .prepare("SELECT key, value FROM settings WHERE key LIKE 'sync%'")
+        .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .map_err(|e| e.to_string())?;
+
+    crate::db::backup_now(live, data_dir, "pre-restore")
+        .map_err(|e| format!("Não foi possível fazer a cópia de segurança antes de restaurar: {e}"))?;
+
+    {
+        let backup = rusqlite::backup::Backup::new(mem, live).map_err(|e| e.to_string())?;
+        backup
+            .run_to_completion(256, Duration::from_millis(0), None)
+            .map_err(|e| format!("Falha ao restaurar: {e}"))?;
+    }
+    crate::db::migrate_open(live, data_dir)?;
+    for (k, v) in keep {
+        set_setting(live, &k, Some(&v));
+    }
+    Ok(())
+}
+
+/// Restaura os dados a partir do último backup no repositório configurado.
+pub fn restore(conn: &Shared, data_dir: &Path) -> Result<String, String> {
+    let result = restore_inner(conn, data_dir);
+    if let Err(e) = &result {
+        log(&format!("Sync: restauração falhou: {e}"));
+    }
+    result
+}
+
+fn restore_inner(conn: &Shared, data_dir: &Path) -> Result<String, String> {
+    let Some(_guard) = RunningGuard::acquire() else {
+        return Err(BUSY.into());
+    };
+    let url = {
+        let c = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let url = get_setting(&c, KEY_REPO).ok_or_else(|| "Configure o endereço do repositório".to_string())?;
+        validate_repo(&url)?
+    };
+    let dir = data_dir.join(REPO_DIR);
+    connect(conn, &dir, &url)?;
+    let sql = fetch_remote_dump(&dir)?;
+    let mem = load_dump(&sql)?;
+
+    let mut live = conn.lock().unwrap_or_else(|e| e.into_inner());
+    replace_live(&mut live, &mem, data_dir)?;
+    let projects: i64 = live
+        .query_row("SELECT COUNT(*) FROM projects WHERE deleted_at IS NULL AND is_inbox = 0", [], |r| r.get(0))
+        .unwrap_or(0);
+    log("Sync: dados restaurados do repositório");
+    Ok(format!(
+        "Dados restaurados do GitHub ({projects} {}). Uma cópia do estado anterior ficou nos backups locais.",
+        if projects == 1 { "projeto" } else { "projetos" }
+    ))
 }
 
 /// Agenda: envia logo após abrir (dando tempo da rede subir no boot), repete
@@ -482,6 +618,130 @@ mod tests {
         );
         assert_eq!(https_to_ssh("git@github.com:a/b.git"), None);
         assert_eq!(https_to_ssh("https://user@github.com/a/b.git"), None);
+    }
+
+    #[test]
+    fn nao_apaga_outros_arquivos_do_repositorio() {
+        let base = std::env::temp_dir().join(format!(
+            "taskforme-git-extra-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let remote = base.join("remote.git");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]).unwrap();
+        let url = remote.to_string_lossy().to_string();
+
+        // Alguém colocou um arquivo próprio no repositório de backup.
+        let other = base.join("other");
+        prepare_repo(&other, &url).unwrap();
+        fs::write(other.join("minhas-anotacoes.txt"), "importante").unwrap();
+        git(&other, &["add", "minhas-anotacoes.txt"]).unwrap();
+        git(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]).unwrap();
+        git(&other, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        // O app, numa cópia nova (ex.: reinstalado), envia o backup.
+        let local = base.join("local");
+        prepare_repo(&local, &url).unwrap();
+        fs::write(local.join(DUMP_FILE), "dados").unwrap();
+        commit_and_push(&local).unwrap();
+
+        let files = git(&remote, &["ls-tree", "--name-only", "main"]).unwrap();
+        assert!(files.contains("minhas-anotacoes.txt"), "arquivo do usuário preservado: {files}");
+        assert!(files.contains(DUMP_FILE));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn restaura_do_repositorio_preservando_config_do_backup() {
+        let base = std::env::temp_dir().join(format!(
+            "taskforme-restore-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let remote = base.join("remote.git");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]).unwrap();
+        let url = remote.to_string_lossy().to_string();
+
+        // Computador A: tem um projeto e envia o backup.
+        let a_dir = base.join("a");
+        fs::create_dir_all(&a_dir).unwrap();
+        let a = crate::db::open(&a_dir).unwrap().conn;
+        a.execute("INSERT INTO projects (name, created_at) VALUES ('Projeto do A', 'x')", []).unwrap();
+        let repo_a = a_dir.join(REPO_DIR);
+        prepare_repo(&repo_a, &url).unwrap();
+        fs::write(repo_a.join(DUMP_FILE), dump(&a).unwrap()).unwrap();
+        commit_and_push(&repo_a).unwrap();
+
+        // Computador B: dados diferentes e o backup configurado.
+        let b_dir = base.join("b");
+        fs::create_dir_all(&b_dir).unwrap();
+        let mut b = crate::db::open(&b_dir).unwrap().conn;
+        b.execute("INSERT INTO projects (name, created_at) VALUES ('Projeto do B', 'x')", []).unwrap();
+        set_setting(&b, KEY_REPO, Some(&url));
+        set_setting(&b, KEY_ENABLED, Some("true"));
+
+        let repo_b = b_dir.join(REPO_DIR);
+        prepare_repo(&repo_b, &url).unwrap();
+        let mem = load_dump(&fetch_remote_dump(&repo_b).unwrap()).unwrap();
+        replace_live(&mut b, &mem, &b_dir).unwrap();
+
+        let names: Vec<String> = b
+            .prepare("SELECT name FROM projects WHERE is_inbox = 0")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["Projeto do A".to_string()]);
+        assert_eq!(get_setting(&b, KEY_REPO).as_deref(), Some(url.as_str()), "config do backup mantida");
+        let pre = fs::read_dir(b_dir.join("backups"))
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().contains("pre-restore"));
+        assert!(pre, "cópia de segurança antes de restaurar");
+        // O banco continua íntegro e utilizável depois da troca.
+        let ok: String = b.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(ok, "ok");
+        b.execute("INSERT INTO projects (name, created_at) VALUES ('Novo', 'x')", []).unwrap();
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn backup_de_versao_antiga_restaura_na_versao_nova() {
+        // Backup feito por uma versão anterior do app (sem a repetição semanal).
+        let old = Connection::open_in_memory().unwrap();
+        for sql in &crate::db::tests_support::MIGRATIONS_FOR_TESTS[..3] {
+            old.execute_batch(sql).unwrap();
+        }
+        old.pragma_update(None, "user_version", 3).unwrap();
+        old.execute(
+            "INSERT INTO tasks (project_id, title, created_at, updated_at) VALUES (1, 'Do backup antigo', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        let sql = dump(&old).unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "taskforme-oldbackup-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut live = crate::db::open(&dir).unwrap().conn;
+        replace_live(&mut live, &load_dump(&sql).unwrap(), &dir).unwrap();
+
+        let v: i64 = live.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, crate::db::schema_version(), "atualizado para o formato novo");
+        let title: String = live.query_row("SELECT title FROM tasks", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "Do backup antigo");
+        // E a coluna nova já funciona.
+        live.execute("UPDATE tasks SET repeat_days = '1'", []).unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recusa_backup_invalido() {
+        assert!(load_dump("isso não é sql").is_err());
+        assert!(load_dump("CREATE TABLE x (a); PRAGMA user_version=1;").is_err());
+        assert!(load_dump("CREATE TABLE projects (is_inbox INTEGER); PRAGMA user_version=99;").is_err());
     }
 
     #[test]

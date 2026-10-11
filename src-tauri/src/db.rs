@@ -132,6 +132,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_events_dates   ON events(start_date, end_date);
     CREATE INDEX idx_events_remind  ON events(remind_at) WHERE reminded = 0;
     "#,
+    // v4: tarefas que se repetem toda semana. Só adiciona colunas (NULL = não repete).
+    r#"
+    ALTER TABLE tasks ADD COLUMN repeat_days TEXT;
+    ALTER TABLE tasks ADD COLUMN next_task_id INTEGER;
+    "#,
 ];
 
 pub struct Opened {
@@ -149,13 +154,23 @@ pub fn open(data_dir: &Path) -> Result<Opened, String> {
             maintenance(&conn, data_dir);
             Ok(Opened { conn, notice: None })
         }
-        // Banco de uma versão mais nova do app não está corrompido: não restaura nada.
-        Err(err) if err.starts_with(NEWER_VERSION) => Err(err),
-        Err(err) => {
-            log(&format!("Banco inválido ({err}). Iniciando recuperação."));
+        // Só recupera de backup quando o arquivo está de fato corrompido. Banco
+        // bloqueado por outro processo, versão mais nova ou falha de migration
+        // não são corrupção: mexer no arquivo aí é que causaria perda de dados.
+        Err(err) if is_corruption(&err) => {
+            log(&format!("Banco corrompido ({err}). Iniciando recuperação."));
             recover(&db_path, data_dir)
         }
+        Err(err) => {
+            log(&format!("Não foi possível abrir o banco: {err}"));
+            Err(err)
+        }
     }
+}
+
+fn is_corruption(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("malformed") || e.contains("not a database") || e.starts_with("quick_check")
 }
 
 fn try_open(db_path: &Path, data_dir: &Path) -> Result<Connection, String> {
@@ -213,6 +228,16 @@ fn migrate(conn: &Connection, db_path: &Path, data_dir: &Path) -> Result<(), Str
         log(&format!("Migration {} aplicada", i + 1));
     }
     Ok(())
+}
+
+/// Versão do esquema que este app conhece.
+pub fn schema_version() -> usize {
+    MIGRATIONS.len()
+}
+
+/// Aplica migrations pendentes numa conexão já aberta (ex.: após restaurar).
+pub fn migrate_open(conn: &Connection, data_dir: &Path) -> Result<(), String> {
+    migrate(conn, &data_dir.join(DB_FILE), data_dir)
 }
 
 fn recover(db_path: &Path, data_dir: &Path) -> Result<Opened, String> {
@@ -284,6 +309,14 @@ pub fn backup_if_due(conn: &Connection, data_dir: &Path) {
 
 /// Backup diário, limpeza de itens excluídos há mais de 7 dias e otimização.
 fn maintenance(conn: &Connection, data_dir: &Path) {
+    // Restos de backups interrompidos (app fechado no meio da cópia).
+    if let Ok(rd) = fs::read_dir(data_dir.join(BACKUP_DIR)) {
+        for p in rd.filter_map(|e| e.ok().map(|e| e.path())) {
+            if p.extension().is_some_and(|x| x == "part") {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
     backup_if_due(conn, data_dir);
 
     let cutoff = (Local::now() - chrono::Duration::days(PURGE_AFTER_DAYS))
@@ -347,6 +380,11 @@ fn list_backups(data_dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default();
     files.sort();
     files
+}
+
+#[cfg(test)]
+pub mod tests_support {
+    pub const MIGRATIONS_FOR_TESTS: &[&str] = super::MIGRATIONS;
 }
 
 #[cfg(test)]
@@ -442,6 +480,12 @@ mod tests {
             conn.execute_batch(MIGRATIONS[0]).unwrap();
             conn.pragma_update(None, "user_version", 1).unwrap();
             conn.execute("INSERT INTO projects (name, created_at) VALUES ('Antigo', 'x')", []).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (project_id, title, due_date, created_at, updated_at)
+                 VALUES (2, 'Tarefa antiga', '2026-10-01', 'x', 'x')",
+                [],
+            )
+            .unwrap();
         }
         let opened = open(&dir).unwrap();
         let n: i64 = opened
@@ -453,10 +497,34 @@ mod tests {
         assert_eq!(links, 0);
         let events: i64 = opened.conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
         assert_eq!(events, 0);
+        // Tarefa criada antes da repetição existir continua igual (não repete).
+        let (title, due, repeat): (String, String, Option<String>) = opened
+            .conn
+            .query_row("SELECT title, due_date, repeat_days FROM tasks", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!((title.as_str(), due.as_str(), repeat), ("Tarefa antiga", "2026-10-01", None));
         let pre = list_backups(&dir)
             .iter()
             .any(|p| p.to_string_lossy().contains("pre-migration"));
         assert!(pre, "backup antes da migration");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn banco_bloqueado_nao_e_tratado_como_corrompido() {
+        let dir = temp_dir("bloqueado");
+        drop(open(&dir).unwrap());
+        // Outro processo segurando o banco com trava exclusiva.
+        let holder = Connection::open(dir.join(DB_FILE)).unwrap();
+        holder.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;").unwrap();
+
+        assert!(open(&dir).is_err(), "deve falhar sem mexer em nada");
+        let quarantined = fs::read_dir(&dir)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("taskforme.corrupt-"));
+        assert!(!quarantined, "um banco só bloqueado nunca pode ser isolado/restaurado");
+        drop(holder);
+        assert!(open(&dir).is_ok(), "liberado, abre normalmente");
         fs::remove_dir_all(&dir).ok();
     }
 

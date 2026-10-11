@@ -8,7 +8,7 @@
   import { api } from "../lib/api";
   import { toggleTask } from "../lib/actions";
   import { autosize } from "../lib/portal";
-  import { shortDate } from "../lib/dates";
+  import { repeatLabel, shortDate } from "../lib/dates";
   import { app, deleteWithUndo, registerFlusher } from "../lib/store.svelte";
   import type { Task } from "../lib/types";
 
@@ -66,7 +66,18 @@
       remindAt: t.remindAt,
       projectId: t.projectId,
       sectionId: t.sectionId,
+      repeatDays: t.repeatDays ?? [],
     };
+  }
+
+  const WEEKDAYS = ["D", "S", "T", "Q", "Q", "S", "S"];
+  const WEEKDAY_NAMES = ["domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado"];
+
+  function toggleDay(day: number) {
+    if (!task) return;
+    const cur = task.repeatDays ?? [];
+    const next = cur.includes(day) ? cur.filter((d) => d !== day) : [...cur, day].sort();
+    void setProp({ repeatDays: next.length ? next : null });
   }
 
   function edited() {
@@ -89,6 +100,7 @@
         if (task) {
           task.dueDate = t.dueDate;
           task.remindAt = t.remindAt;
+          task.repeatDays = t.repeatDays;
         }
         savedRev = target;
         app.touch();
@@ -198,6 +210,24 @@
         <div>
           <DateField value={task.remindAt} mode="datetime" onchange={(v) => setProp({ remindAt: v })} placeholder="Sem lembrete" />
         </div>
+        {#if !task.parentId}
+          <span class="label">Repetir</span>
+          <div class="repeat">
+            <div class="days" role="group" aria-label="Dias em que repete">
+              {#each WEEKDAYS as w, i (i)}
+                <button
+                  type="button"
+                  class="day"
+                  class:on={task.repeatDays?.includes(i)}
+                  title={WEEKDAY_NAMES[i]}
+                  aria-pressed={!!task.repeatDays?.includes(i)}
+                  onclick={() => toggleDay(i)}>{w}</button
+                >
+              {/each}
+            </div>
+            <span class="repeat-label">{task.repeatDays ? repeatLabel(task.repeatDays) : "Não repete"}</span>
+          </div>
+        {/if}
       </div>
 
       <textarea
@@ -365,6 +395,39 @@
   }
   .label {
     font-size: 12.5px;
+    color: var(--ink-subtle);
+  }
+  .repeat {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .days {
+    display: flex;
+    gap: 3px;
+  }
+  .day {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--ink-subtle);
+    border: 1px solid var(--hairline);
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .day:hover {
+    color: var(--ink);
+    border-color: var(--hairline-strong);
+  }
+  .day.on {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: var(--on-primary);
+  }
+  .repeat-label {
+    font-size: 12px;
     color: var(--ink-subtle);
   }
   .desc {

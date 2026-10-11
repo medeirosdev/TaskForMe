@@ -137,7 +137,7 @@
         </button>
       {:else}
         <button type="button" onclick={() => commit(inOneHour())}>
-          <AlarmClock size={15} /> Em 1 hora <em>{inOneHour().slice(11)}</em>
+          <AlarmClock size={15} /> Em 1 hora <em>{inOneHour().slice(0, 10) === today ? inOneHour().slice(11) : reminderLabel(inOneHour(), today)}</em>
         </button>
         {#if nowHour < 18}
           <button type="button" onclick={() => commit(`${today}T18:00`)}><Sun size={15} /> Hoje <em>18:00</em></button>

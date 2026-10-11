@@ -150,12 +150,14 @@ pub struct Task {
     project_name: String,
     project_color: String,
     parent_title: Option<String>,
+    /// Dias da semana em que repete (0 = domingo … 6 = sábado). `None` = não repete.
+    repeat_days: Option<Vec<u8>>,
 }
 
 const TASK_SELECT: &str = "
     SELECT t.id, t.project_id, t.section_id, t.parent_id, t.title, t.description,
            t.due_date, t.remind_at, t.done, t.position, t.created_at,
-           p.name, p.color, par.title
+           p.name, p.color, par.title, t.repeat_days
     FROM tasks t
     JOIN projects p    ON p.id = t.project_id
     LEFT JOIN tasks par ON par.id = t.parent_id
@@ -177,7 +179,166 @@ fn task_from(r: &Row) -> rusqlite::Result<Task> {
         project_name: r.get(11)?,
         project_color: r.get(12)?,
         parent_title: r.get(13)?,
+        repeat_days: parse_days(r.get::<_, Option<String>>(14)?.as_deref()),
     })
+}
+
+// ---------------------------------------------------------------- repetição semanal
+
+fn parse_days(s: Option<&str>) -> Option<Vec<u8>> {
+    let v: Vec<u8> = s?.split(',').filter_map(|d| d.trim().parse().ok()).filter(|d| *d < 7).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+fn days_text(v: &Option<Vec<u8>>) -> Option<String> {
+    v.as_ref().map(|d| d.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
+}
+
+/// Valida, ordena e remove repetidos. Lista vazia = não repete.
+fn normalize_days(mut v: Vec<u8>) -> Res<Option<Vec<u8>>> {
+    if v.iter().any(|d| *d > 6) {
+        return fail("Dia da semana inválido");
+    }
+    v.sort_unstable();
+    v.dedup();
+    Ok((!v.is_empty()).then_some(v))
+}
+
+/// Primeiro dia da lista estritamente depois de `after`.
+fn next_occurrence(days: &[u8], after: NaiveDate) -> NaiveDate {
+    use chrono::Datelike;
+    (1..=7)
+        .map(|i| after + chrono::Duration::days(i))
+        .find(|d| days.contains(&(d.weekday().num_days_from_sunday() as u8)))
+        .unwrap_or(after + chrono::Duration::days(7))
+}
+
+fn today() -> NaiveDate {
+    Local::now().date_naive()
+}
+
+fn parse_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+fn shift_date(s: &Option<String>, days: i64) -> Option<String> {
+    s.as_deref()
+        .and_then(parse_date)
+        .map(|d| (d + chrono::Duration::days(days)).format("%Y-%m-%d").to_string())
+}
+
+fn shift_datetime(s: &Option<String>, days: i64) -> Option<String> {
+    s.as_deref()
+        .and_then(|v| NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M").ok())
+        .map(|d| (d + chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M").to_string())
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DoneResult {
+    /// Próxima ocorrência criada ao concluir uma tarefa que se repete.
+    next_id: Option<i64>,
+    next_date: Option<String>,
+}
+
+/// Marca/desmarca. Ao concluir uma tarefa que se repete, cria a próxima; ao
+/// desmarcar, remove a próxima que ela tinha criado (se ainda estiver aberta),
+/// para nunca sobrar duplicata.
+fn set_done(conn: &mut Connection, id: i64, done: bool, today: NaiveDate) -> Res<DoneResult> {
+    let (parent, was_done, repeat, next_id, due, remind): (Option<i64>, bool, Option<String>, Option<i64>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT parent_id, done, repeat_days, next_task_id, due_date, remind_at
+             FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError("Tarefa não encontrada".into()))?;
+
+    let ts = now();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE tasks SET done = ?2, done_at = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, done, done.then(|| ts.clone()), ts],
+    )?;
+    let mut result = DoneResult::default();
+
+    if done {
+        // Concluir a tarefa-mãe conclui as subtarefas.
+        tx.execute(
+            "UPDATE tasks SET done = 1, done_at = ?2, updated_at = ?2
+             WHERE parent_id = ?1 AND done = 0 AND deleted_at IS NULL",
+            params![id, ts],
+        )?;
+
+        let days = parse_days(repeat.as_deref());
+        let existing_next = match next_id {
+            Some(n) => tx
+                .query_row("SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL", [n], |_| Ok(()))
+                .optional()?
+                .map(|_| n),
+            None => None,
+        };
+        if let (None, false, Some(days), None) = (parent, was_done, days, existing_next) {
+            // Concluída adiantada: a próxima vem depois da data marcada.
+            // Atrasada: depois de hoje (nunca cria ocorrência no passado).
+            let due_d = due.as_deref().and_then(parse_date).unwrap_or(today);
+            let next = next_occurrence(&days, due_d.max(today));
+            let delta = (next - due_d).num_days();
+            let next_s = next.format("%Y-%m-%d").to_string();
+
+            tx.execute(
+                "INSERT INTO tasks (project_id, section_id, title, description, due_date, remind_at,
+                                    repeat_days, position, created_at, updated_at)
+                 SELECT project_id, section_id, title, description, ?2, ?3, repeat_days,
+                        (SELECT COALESCE(MAX(position), 0) + 1 FROM tasks WHERE project_id = t.project_id),
+                        ?4, ?4
+                 FROM tasks t WHERE id = ?1",
+                params![id, next_s, shift_datetime(&remind, delta), ts],
+            )?;
+            let new_id = tx.last_insert_rowid();
+
+            // Subtarefas vão junto, desmarcadas e com as datas deslocadas.
+            let subs: Vec<(String, String, Option<String>, Option<String>, i64)> = tx
+                .prepare(
+                    "SELECT title, description, due_date, remind_at, position FROM tasks
+                     WHERE parent_id = ?1 AND deleted_at IS NULL ORDER BY position, id",
+                )?
+                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (title, desc, sdue, sremind, pos) in subs {
+                tx.execute(
+                    "INSERT INTO tasks (project_id, section_id, parent_id, title, description, due_date,
+                                        remind_at, position, created_at, updated_at)
+                     SELECT project_id, section_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7 FROM tasks WHERE id = ?1",
+                    params![new_id, title, desc, shift_date(&sdue, delta), shift_datetime(&sremind, delta), pos, ts],
+                )?;
+            }
+
+            tx.execute("UPDATE tasks SET next_task_id = ?2 WHERE id = ?1", params![id, new_id])?;
+            result = DoneResult { next_id: Some(new_id), next_date: Some(next_s) };
+        }
+    } else if let Some(n) = next_id {
+        // Desfez a conclusão: some com a próxima, se ninguém mexeu nela ainda.
+        let open: bool = tx
+            .query_row(
+                "SELECT done = 0 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                [n],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if open {
+            tx.execute(
+                "UPDATE tasks SET deleted_at = ?2 WHERE (id = ?1 OR parent_id = ?1) AND deleted_at IS NULL",
+                params![n, delete_token()],
+            )?;
+        }
+        tx.execute("UPDATE tasks SET next_task_id = NULL WHERE id = ?1", [id])?;
+    }
+
+    tx.commit()?;
+    Ok(result)
 }
 
 fn get_task(conn: &Connection, id: i64) -> Res<Task> {
@@ -545,14 +706,28 @@ pub struct TaskPatch {
     remind_at: Option<String>,
     project_id: i64,
     section_id: Option<i64>,
+    /// Ausente/null: mantém como está. Lista vazia: deixa de repetir.
+    #[serde(default)]
+    repeat_days: Option<Vec<u8>>,
 }
 
 #[tauri::command]
 pub fn task_update(state: State<AppState>, input: TaskPatch) -> Res<Task> {
     let mut conn = state.conn();
     let current = get_task(&conn, input.id)?;
-    let due = valid_date(input.due_date)?;
+    let mut due = valid_date(input.due_date)?;
     let remind = valid_datetime(input.remind_at)?;
+
+    // Só tarefas principais repetem (subtarefas acompanham a mãe).
+    let repeat = match (current.parent_id, input.repeat_days) {
+        (Some(_), _) => None,
+        (None, None) => current.repeat_days.clone(),
+        (None, Some(v)) => normalize_days(v)?,
+    };
+    // Tarefa que repete precisa de data: usa o próximo dia escolhido a partir de hoje.
+    if let (Some(days), None) = (&repeat, &due) {
+        due = Some(next_occurrence(days, today() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string());
+    }
 
     let (project, section) = if current.parent_id.is_some() {
         (current.project_id, current.section_id)
@@ -565,7 +740,7 @@ pub fn task_update(state: State<AppState>, input: TaskPatch) -> Res<Task> {
     tx.execute(
         "UPDATE tasks SET title = ?2, description = ?3, due_date = ?4, remind_at = ?5,
                 reminded = CASE WHEN remind_at IS ?5 THEN reminded ELSE 0 END,
-                project_id = ?6, section_id = ?7, updated_at = ?8
+                project_id = ?6, section_id = ?7, updated_at = ?8, repeat_days = ?9
          WHERE id = ?1",
         params![
             input.id,
@@ -575,7 +750,8 @@ pub fn task_update(state: State<AppState>, input: TaskPatch) -> Res<Task> {
             remind,
             project,
             section,
-            now()
+            now(),
+            days_text(&repeat)
         ],
     )?;
     // Ao mover a tarefa-mãe, as subtarefas vão junto.
@@ -588,25 +764,8 @@ pub fn task_update(state: State<AppState>, input: TaskPatch) -> Res<Task> {
 }
 
 #[tauri::command]
-pub fn task_set_done(state: State<AppState>, id: i64, done: bool) -> Res<()> {
-    let mut conn = state.conn();
-    let ts = now();
-    let done_at = done.then(|| ts.clone());
-    let tx = conn.transaction()?;
-    tx.execute(
-        "UPDATE tasks SET done = ?2, done_at = ?3, updated_at = ?4 WHERE id = ?1 AND deleted_at IS NULL",
-        params![id, done, done_at, ts],
-    )?;
-    // Concluir a tarefa-mãe conclui as subtarefas.
-    if done {
-        tx.execute(
-            "UPDATE tasks SET done = 1, done_at = ?2, updated_at = ?2
-             WHERE parent_id = ?1 AND done = 0 AND deleted_at IS NULL",
-            params![id, ts],
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
+pub fn task_set_done(state: State<AppState>, id: i64, done: bool) -> Res<DoneResult> {
+    set_done(&mut state.conn(), id, done, today())
 }
 
 #[tauri::command]
@@ -1260,4 +1419,136 @@ pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Res<String>
         .await
         .map_err(|e| AppError(e.to_string()))?
         .map_err(AppError)
+}
+
+/// Substitui os dados atuais pelo último backup do repositório.
+#[tauri::command]
+pub async fn sync_restore(state: State<'_, AppState>) -> Res<String> {
+    let conn = state.shared();
+    let dir = state.data_dir.clone();
+    let msg = tauri::async_runtime::spawn_blocking(move || crate::sync::restore(&conn, &dir))
+        .await
+        .map_err(|e| AppError(e.to_string()))?
+        .map_err(AppError)?;
+    // Configurações restauradas que o backend guarda em memória.
+    let close = state
+        .conn()
+        .query_row("SELECT value FROM settings WHERE key = 'closeToTray'", [], |r| r.get::<_, String>(0))
+        .map(|v| v == "true")
+        .unwrap_or(true);
+    state.close_to_tray.store(close, Ordering::Relaxed);
+    Ok(msg)
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    fn d(s: &str) -> NaiveDate {
+        parse_date(s).unwrap()
+    }
+
+    #[test]
+    fn proxima_ocorrencia() {
+        // 2026-10-12 é segunda (1). Dias: seg(1), qua(3), sex(5).
+        let days = [1, 3, 5];
+        assert_eq!(next_occurrence(&days, d("2026-10-12")), d("2026-10-14"));
+        assert_eq!(next_occurrence(&days, d("2026-10-16")), d("2026-10-19"));
+        assert_eq!(next_occurrence(&[0], d("2026-10-11")), d("2026-10-18"), "domingo a domingo");
+        assert_eq!(next_occurrence(&[6], d("2026-12-30")), d("2027-01-02"), "virada de ano");
+    }
+
+    fn setup() -> (PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!(
+            "taskforme-repeat-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::open(&dir).unwrap().conn;
+        (dir, conn)
+    }
+
+    fn add_task(conn: &Connection, title: &str, due: &str, repeat: Option<&str>, remind: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, due_date, remind_at, repeat_days, created_at, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, 'x', 'x')",
+            params![title, due, remind, repeat],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn open_tasks(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare("SELECT title, due_date FROM tasks WHERE done = 0 AND deleted_at IS NULL AND parent_id IS NULL ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    use std::path::PathBuf;
+
+    #[test]
+    fn concluir_cria_a_proxima_com_subtarefas_e_lembrete() {
+        let (dir, mut conn) = setup();
+        // Toda segunda, vence seg 12/10 com lembrete às 08:30.
+        let id = add_task(&conn, "Relatório", "2026-10-12", Some("1"), Some("2026-10-12T08:30"));
+        conn.execute(
+            "INSERT INTO tasks (project_id, parent_id, title, created_at, updated_at) VALUES (1, ?1, 'Juntar dados', 'x', 'x')",
+            [id],
+        )
+        .unwrap();
+
+        let r = set_done(&mut conn, id, true, d("2026-10-12")).unwrap();
+        assert_eq!(r.next_date.as_deref(), Some("2026-10-19"));
+        let next = r.next_id.unwrap();
+        let (remind, repeat): (Option<String>, Option<String>) = conn
+            .query_row("SELECT remind_at, repeat_days FROM tasks WHERE id = ?1", [next], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(remind.as_deref(), Some("2026-10-19T08:30"));
+        assert_eq!(repeat.as_deref(), Some("1"));
+        let subs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE parent_id = ?1 AND done = 0", [next], |r| r.get(0))
+            .unwrap();
+        assert_eq!(subs, 1, "subtarefa copiada e desmarcada");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concluir_atrasado_nunca_cria_no_passado() {
+        let (dir, mut conn) = setup();
+        let id = add_task(&conn, "Atrasada", "2026-09-28", Some("1"), None);
+        let r = set_done(&mut conn, id, true, d("2026-10-14")).unwrap();
+        assert_eq!(r.next_date.as_deref(), Some("2026-10-19"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desmarcar_e_marcar_de_novo_nao_duplica() {
+        let (dir, mut conn) = setup();
+        let id = add_task(&conn, "Academia", "2026-10-12", Some("1,3"), None);
+        set_done(&mut conn, id, true, d("2026-10-12")).unwrap();
+        assert_eq!(open_tasks(&conn), vec![("Academia".into(), "2026-10-14".into())]);
+
+        // Desfazer: a próxima some e a original volta a ficar aberta.
+        set_done(&mut conn, id, false, d("2026-10-12")).unwrap();
+        assert_eq!(open_tasks(&conn), vec![("Academia".into(), "2026-10-12".into())]);
+
+        // Concluir de novo: só uma próxima.
+        set_done(&mut conn, id, true, d("2026-10-12")).unwrap();
+        set_done(&mut conn, id, true, d("2026-10-12")).unwrap();
+        assert_eq!(open_tasks(&conn).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tarefa_comum_nao_repete() {
+        let (dir, mut conn) = setup();
+        let id = add_task(&conn, "Uma vez", "2026-10-12", None, None);
+        let r = set_done(&mut conn, id, true, d("2026-10-12")).unwrap();
+        assert!(r.next_id.is_none());
+        assert!(open_tasks(&conn).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

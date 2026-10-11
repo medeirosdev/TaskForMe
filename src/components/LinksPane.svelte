@@ -60,9 +60,20 @@
     try {
       await navigator.clipboard.writeText(l.url);
       toast("Link copiado");
+      return;
     } catch {
-      toast("Não foi possível copiar o link", { kind: "error" });
+      /* WebKitGTK pode negar a API de área de transferência: usa o método antigo */
     }
+    const ta = document.createElement("textarea");
+    ta.value = l.url;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    toast(ok ? "Link copiado" : "Não foi possível copiar o link", { kind: ok ? "info" : "error" });
   }
 </script>
 

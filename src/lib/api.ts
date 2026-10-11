@@ -27,6 +27,8 @@ export interface TaskPatch {
   remindAt: string | null;
   projectId: number;
   sectionId: number | null;
+  /** Omitido: mantém. Lista vazia: deixa de repetir. */
+  repeatDays?: number[];
 }
 
 export interface NotePatch {
@@ -51,6 +53,7 @@ export const api = {
   syncStatus: () => call<SyncStatus>("sync_status"),
   syncConfigure: (repo: string, enabled: boolean) => call<SyncStatus>("sync_configure", { repo, enabled }),
   syncNow: () => call<string>("sync_now"),
+  syncRestore: () => call<string>("sync_restore"),
 
   projects: () => call<Project[]>("projects_list"),
   projectCreate: (name: string, color: string) => call<number>("project_create", { name, color }),
@@ -73,7 +76,8 @@ export const api = {
     dueDate?: string | null;
   }) => call<Task>("task_create", { input }),
   taskUpdate: (input: TaskPatch) => call<Task>("task_update", { input }),
-  taskSetDone: (id: number, done: boolean) => call<void>("task_set_done", { id, done }),
+  taskSetDone: (id: number, done: boolean) =>
+    call<{ nextId: number | null; nextDate: string | null }>("task_set_done", { id, done }),
   taskDelete: (id: number) => call<string>("task_delete", { id }),
   task: (id: number) => call<Task>("task_get", { id }),
   tasksByProject: (projectId: number) => call<Task[]>("tasks_by_project", { projectId }),

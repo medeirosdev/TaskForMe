@@ -69,6 +69,11 @@
       timeError = "start";
       return;
     }
+    if (!allDay && !period && endTime && endTime <= startTime) {
+      timeError = "end";
+      toast("A hora de término precisa ser depois da hora de início", { kind: "error" });
+      return;
+    }
     busy = true;
     try {
       await api.eventSave({

@@ -1,7 +1,7 @@
 <script lang="ts">
   import Checkbox from "./Checkbox.svelte";
-  import { AlarmClock, Calendar, ChevronRight, CornerDownRight, Inbox, ListChecks, TextAlign } from "../lib/icons";
-  import { dueTone, relativeDate, reminderLabel } from "../lib/dates";
+  import { AlarmClock, Calendar, ChevronRight, CornerDownRight, Inbox, ListChecks, Repeat, TextAlign } from "../lib/icons";
+  import { dueTone, relativeDate, reminderLabel, repeatLabel } from "../lib/dates";
   import { app } from "../lib/store.svelte";
   import type { Task } from "../lib/types";
 
@@ -79,6 +79,9 @@
       <span class="m" class:complete={progress.done === progress.total} title="Subtarefas">
         <ListChecks size={13} />{progress.done}/{progress.total}
       </span>
+    {/if}
+    {#if task.repeatDays && !task.done}
+      <span class="m" title="Repete: {repeatLabel(task.repeatDays)}"><Repeat size={13} /></span>
     {/if}
     {#if task.remindAt && !task.done}
       <span class="m" title="Lembrete"><AlarmClock size={13} />{reminderLabel(task.remindAt, app.today)}</span>

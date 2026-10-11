@@ -1,4 +1,5 @@
 import { api } from "./api";
+import { dayName, shortDate } from "./dates";
 import { app } from "./store.svelte";
 import { toast } from "./toast.svelte";
 import type { Task } from "./types";
@@ -13,8 +14,9 @@ export async function toggleTask(task: Task, done: boolean, all: Task[] = []) {
   children.forEach((c) => (c.done = true));
   if (done) app.recentDone.add(task.id);
 
+  let nextDate: string | null = null;
   try {
-    await api.taskSetDone(task.id, done);
+    nextDate = (await api.taskSetDone(task.id, done)).nextDate;
   } catch {
     task.done = !done;
     children.forEach((c) => (c.done = false));
@@ -27,7 +29,8 @@ export async function toggleTask(task: Task, done: boolean, all: Task[] = []) {
 
   if (done) {
     const title = task.title.length > 40 ? `${task.title.slice(0, 40)}…` : task.title;
-    toast(`“${title}” concluída`, {
+    const next = nextDate ? ` · próxima: ${dayName(nextDate, app.today)}, ${shortDate(nextDate, app.today)}` : "";
+    toast(`“${title}” concluída${next}`, {
       action: {
         label: "Desfazer",
         run: async () => {

@@ -29,6 +29,8 @@ export interface Task {
   projectName: string;
   projectColor: string;
   parentTitle: string | null;
+  /** Dias da semana em que repete (0 = domingo … 6 = sábado). */
+  repeatDays: number[] | null;
 }
 
 export interface Note {

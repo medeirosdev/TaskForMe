@@ -4,6 +4,7 @@ Notas, tarefas e lembretes organizados por projeto. É leve, roda offline e func
 
 - **Projetos** com **divisões** (ex.: "Reuniões", "Backlog")
 - **Tarefas** com **subtarefas**, data, lembrete e descrição
+- **Tarefas que se repetem** toda semana nos dias escolhidos (ao concluir, a próxima é criada sozinha)
 - **Notas** com salvamento automático, data e lembrete
 - **Eventos** de um dia ou de um período, com horário ou dia inteiro e **aviso** (na hora, 15 min, 1 h, 1 dia ou 1 semana antes)
 - Tela **Todos os eventos**, com os eventos de todos os projetos agrupados por mês
@@ -67,6 +68,8 @@ src-tauri/              Backend (Rust + Tauri 2)
 | Erro inesperado na interface | Aparece um aviso, sem tela branca. Os dados ficam no backend |
 | Dois cliques no ícone | Instância única: abre a janela que já está aberta, sem dois processos no mesmo banco |
 | Banco de uma versão mais nova | O app se recusa a abrir em vez de "consertar" e perder dados |
+| Banco bloqueado por outro programa | O app avisa e não toca no arquivo (só recupera de backup quando há corrupção de verdade) |
+| Atualizou o app com ele aberto na bandeja | Ao abrir pelo menu, ele reinicia sozinho na versão nova |
 | Entrada inválida (data, cor, projeto, link) | Validada no backend; a interface não consegue gravar lixo |
 | Link malicioso (`javascript:`, `file:`) | Só endereços `http(s)` são aceitos e abertos |
 
@@ -80,7 +83,9 @@ Em **Configurações → Backup no GitHub**, informe o endereço de um repositó
 - usa a sua identidade e as suas credenciais do Git (chave SSH ou login salvo). Nunca pede senha;
 - se falhar (sem internet, sem permissão), tenta de novo em 2, 10, 30 e 60 minutos e mostra o motivo em Configurações.
 
-O próprio repositório recebe um `README.md` com as instruções de restauração.
+Para recuperar os dados (ex.: em um computador novo), use **Configurações → Backup no GitHub →
+Restaurar do GitHub**. O app confere o backup, guarda uma cópia dos dados atuais nos backups locais
+e só então substitui. Arquivos que você colocar no repositório de backup são preservados.
 
 ### Onde ficam os dados
 

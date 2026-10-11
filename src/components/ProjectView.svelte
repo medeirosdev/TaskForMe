@@ -149,7 +149,8 @@
     display: flex;
     align-items: flex-end;
     justify-content: space-between;
-    gap: 12px;
+    flex-wrap: wrap;
+    gap: 4px 12px;
     margin-top: 14px;
   }
   .seg {
@@ -183,6 +184,7 @@
     display: flex;
     gap: 6px;
     padding-bottom: 6px;
+    margin-left: auto;
   }
   .content {
     flex: 1;

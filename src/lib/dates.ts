@@ -80,6 +80,18 @@ export function dayName(s: string, today = todayIso()): string {
   return cap(fmtWeekday.format(parseIso(s)).replace("-feira", ""));
 }
 
+const DAY_SHORT = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
+const DAY_LONG = ["domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado"];
+
+/** "Toda segunda", "Dias úteis", "Todo dia", "seg, qua, sex". */
+export function repeatLabel(days: number[]): string {
+  const d = [...days].sort();
+  if (d.length === 7) return "Todo dia";
+  if (d.join() === "1,2,3,4,5") return "Dias úteis";
+  if (d.length === 1) return `${d[0] === 0 || d[0] === 6 ? "Todo" : "Toda"} ${DAY_LONG[d[0]]}`;
+  return d.map((x) => DAY_SHORT[x]).join(", ");
+}
+
 export function longDate(s: string): string {
   return cap(fmtLong.format(parseIso(s)));
 }

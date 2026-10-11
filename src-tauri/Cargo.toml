@@ -1,6 +1,6 @@
 [package]
 name = "taskforme"
-version = "0.2.0"
+version = "0.3.0"
 description = "Notas, tarefas e lembretes por projeto"
 authors = ["Medeiros"]
 edition = "2021"

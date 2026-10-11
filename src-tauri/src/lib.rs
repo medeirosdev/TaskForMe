@@ -15,6 +15,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 use logger::log;
+use tauri_plugin_notification::NotificationExt;
 
 pub type Shared = Arc<Mutex<Connection>>;
 
@@ -58,6 +59,50 @@ fn request_quit(app: &AppHandle) {
     });
 }
 
+/// O executável em disco foi substituído (app atualizado) desde que este
+/// processo abriu? Compara o arquivo em execução com o que está no caminho.
+#[cfg(target_os = "linux")]
+fn binary_replaced() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe().ok()?;
+    let path = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)").to_string());
+    let running = std::fs::metadata("/proc/self/exe").ok()?;
+    let on_disk = std::fs::metadata(&path).ok()?;
+    (running.ino() != on_disk.ino() || running.dev() != on_disk.dev()).then_some(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn binary_replaced() -> Option<PathBuf> {
+    // No Windows o instalador fecha o app antes de atualizar.
+    None
+}
+
+/// Abrir o app pelo menu depois de uma atualização: em vez de só mostrar a
+/// janela da versão antiga (que ficou na bandeja), reinicia na versão nova.
+fn on_second_instance(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    if let Some(path) = binary_replaced() {
+        log("Executável atualizado: reiniciando na nova versão");
+        // Espera este processo terminar (até 1,5 s) antes de abrir o novo.
+        let spawned = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2; exec \"$0\"")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                request_quit(app);
+                return;
+            }
+            Err(e) => log(&format!("Não foi possível reiniciar: {e}")),
+        }
+    }
+    show_main(app);
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Abrir TaskForMe", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
@@ -94,7 +139,7 @@ pub fn run() {
     let result = tauri::Builder::default()
         // Precisa ser o primeiro plugin: uma segunda instância só foca a janela
         // existente, evitando dois processos escrevendo no mesmo banco.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| on_second_instance(app)))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -108,10 +153,20 @@ pub fn run() {
             logger::init(data_dir.clone());
             log(&format!("Iniciando TaskForMe {}", env!("CARGO_PKG_VERSION")));
 
-            let opened = db::open(&data_dir).map_err(|e| {
-                log(&format!("Falha fatal ao abrir banco: {e}"));
-                e
-            })?;
+            let opened = match db::open(&data_dir) {
+                Ok(o) => o,
+                Err(e) => {
+                    log(&format!("Falha fatal ao abrir banco: {e}"));
+                    // Sem banco não há interface: avisa por notificação em vez de sumir.
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("TaskForMe não conseguiu abrir seus dados")
+                        .body(format!("{e}\nNada foi alterado. Detalhes em {}", data_dir.join("taskforme.log").display()))
+                        .show();
+                    return Err(e.into());
+                }
+            };
 
             let close_to_tray = opened
                 .conn
@@ -213,6 +268,7 @@ pub fn run() {
             commands::sync_status,
             commands::sync_configure,
             commands::sync_now,
+            commands::sync_restore,
         ])
         .run(tauri::generate_context!());
 
